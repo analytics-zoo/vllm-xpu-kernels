@@ -74,6 +74,11 @@ struct chunk_prefill_args_t {
   int o_stride_batch = 0;
   // per-batch mask: true = prefill, false = decode; nullptr = process all
   void* is_prefill = nullptr;
+  // per-sequence causal mask: true = causal, false = bidirectional;
+  // nullptr = all sequences follow the compile-time CausalMask flag.
+  // Used by DiffusionGemma to handle encoder(causal)+denoise(bidir) in one
+  // launch instead of splitting the batch into two FA2 calls.
+  void* per_seq_causal = nullptr;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -174,7 +179,8 @@ struct KernelLauncher {
          reinterpret_cast<ElementQ*>(args.sm_sink),
          args.softmax_lse,
          args.lse_stride,
-         static_cast<const bool*>(args.is_prefill)},
+         static_cast<const bool*>(args.is_prefill),
+         static_cast<const bool*>(args.per_seq_causal)},
         {args.sm_scale,
          args.k_scale,
          args.v_scale,

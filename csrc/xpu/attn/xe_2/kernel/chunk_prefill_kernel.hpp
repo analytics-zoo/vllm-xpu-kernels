@@ -153,6 +153,9 @@ class XeFMHAFwdKernel {
 
     // per-batch mask: true = prefill, false = decode; nullptr = process all
     const bool* is_prefill;
+    // per-sequence causal mask: true = causal, false = bidirectional;
+    // nullptr = follow the compile-time CausalMask flag for all sequences.
+    const bool* per_seq_causal;
   };
   using KernelParams = KernelArguments;
 
@@ -271,9 +274,17 @@ class XeFMHAFwdKernel {
       int seq_coord =
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
+      // Per-sequence causal: when compiled CausalMask=true but this sequence
+      // is bidirectional (per_seq_causal[idx_b]==false), treat it as
+      // non-causal — use the FULL kv range (un-pruned) and skip the triangular
+      // mask. nullptr => follow the compile-time CausalMask for all sequences.
+      const bool seq_is_causal =
+          CausalMask &&
+          (p.per_seq_causal == nullptr || p.per_seq_causal[idx_b]);
+
       // calc sg level seq_len_kv
       const int seq_len =
-          CausalMask
+          seq_is_causal
               ? LocalMask
                     ? cute::min(
                           seq_len_kv,
@@ -290,9 +301,12 @@ class XeFMHAFwdKernel {
                     get<1>(TileShapeQK{})
               : 0;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      // For a bidirectional sequence inside a CausalMask=true kernel, set the
+      // causal boundary at/above k_blocks so the mainloop's
+      // need_causal = (K >= blk_k1_causal) is NEVER true → no triangular mask.
       const int k_blocks_causal =
-          CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
-                     : 0;
+          seq_is_causal ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
+                        : k_blocks;
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       if constexpr (is_var_len) {
@@ -355,7 +369,8 @@ class XeFMHAFwdKernel {
           k_blocks_causal,
           thr_id,
           seq_len,
-          full_tile_offset);
+          full_tile_offset,
+          seq_is_causal);
 
       // return softmax_lse
       if constexpr (SoftmaxLSE) {

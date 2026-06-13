@@ -53,6 +53,7 @@ def flash_attn_varlen_func(
     s_aux: Optional[torch.Tensor] = None,
     num_splits_kv: Optional[int] = None,
     is_mix_batch: bool = True,
+    per_seq_causal: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -151,7 +152,8 @@ def flash_attn_varlen_func(
             return_softmax_lse,
             None,
             num_splits_kv,
-            is_mix_batch
+            is_mix_batch,
+            per_seq_causal,
         )
     else:
         raise NotImplementedError("not support yet")

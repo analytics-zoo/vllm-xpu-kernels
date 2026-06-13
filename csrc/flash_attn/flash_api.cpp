@@ -118,7 +118,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
     const bool return_softmax,
     std::optional<at::Generator> gen_,
     std::optional<int> num_splits,
-    bool mix_batch) {
+    bool mix_batch,
+    // Per-sequence causal mask [num_seqs] bool: true=causal, false=bidir.
+    // When provided, one launch handles a mixed causal/bidirectional batch
+    // (DiffusionGemma encoder+denoise) instead of splitting into 2 FA2 calls.
+    std::optional<const at::Tensor>& per_seq_causal_) {
   auto q_type = q.scalar_type();
   auto k_type = k.scalar_type();
   TORCH_CHECK(
@@ -228,7 +232,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_local,
         is_sink,
         softmax_lse_opt,
-        no_mask);
+        no_mask,
+        per_seq_causal_);
   } else if (max_seqlen_q > 1) {
     if (!out_.has_value()) {
       out = torch::empty_like(q);
@@ -262,7 +267,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_local,
         is_sink,
         softmax_lse_opt,
-        is_prefill_opt);
+        is_prefill_opt,
+        per_seq_causal_);
 
     // Paged decode: processes only decode batches (skips prefill)
     int eff_window_left =
@@ -439,7 +445,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float softmax_scale, Tensor? softmax_sink, bool zero_tensors, "
       "bool is_causal, int window_size_left, int window_size_right, float "
       "softcap, bool return_softmax, "
-      "Generator? gen, int? num_splits, bool mix_batch) -> Tensor[]");
+      "Generator? gen, int? num_splits, bool mix_batch, "
+      "Tensor? per_seq_causal) -> Tensor[]");
   ops.impl(
       "varlen_fwd",
       torch::kXPU,
