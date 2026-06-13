@@ -339,6 +339,19 @@ CUTE_DEVICE void xe_gemm_4bits(
   int group_num = get<1>(A.shape()) / group_size;
   int x_idx = sg_local_id / channel_num;
 
+  // FIX (2026-06-01): block_2d_prefetch on the scales tensor uses
+  // group_num * sizeof(ElementS) as the row pitch. Xe2 block_2d_load
+  // requires pitch >= 64B and 16B-aligned. When K is not a power-of-two
+  // multiple of group_size (e.g. Qwen3.5-35B W2: K=1408, group_num=11,
+  // pitch=22B), the prefetch over-reads adjacent memory and can hit
+  // unrelated live tensors -> bogus scales -> DEVICE_LOST.
+  // Skip the scale prefetch in that case; the actual scale load below
+  // (regular indexing, lines further down) still works correctly. The
+  // prefetch is a perf hint, dropping it costs ~1-3% on this path only.
+  const bool can_prefetch_scales =
+      (group_num * static_cast<int>(sizeof(ElementS))) >= 64 &&
+      ((group_num * static_cast<int>(sizeof(ElementS))) % 16) == 0;
+
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num];
 
@@ -354,7 +367,7 @@ CUTE_DEVICE void xe_gemm_4bits(
     prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
 
-    if (k_tile_prefetch * group_size < shape<1>(A)) {
+    if (can_prefetch_scales && k_tile_prefetch * group_size < shape<1>(A)) {
       auto next_scales_tensor = make_tensor(
           make_gmem_ptr(
               reinterpret_cast<const ElementS*>(
@@ -406,7 +419,8 @@ CUTE_DEVICE void xe_gemm_4bits(
         }
       }
 
-      if ((group_idx + prefetch_dist) * group_size < shape<1>(A)) {
+      if (can_prefetch_scales &&
+          (group_idx + prefetch_dist) * group_size < shape<1>(A)) {
         auto next_scales_tensor = make_tensor(
             make_gmem_ptr(
                 reinterpret_cast<const ElementS*>(

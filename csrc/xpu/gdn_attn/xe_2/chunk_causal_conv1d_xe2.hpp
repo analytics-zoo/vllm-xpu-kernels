@@ -536,8 +536,14 @@ struct chunk_update_states_kernel {
     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
     const T* conv_states_tmp_ptr =
         conv_states_tmp + batch_id * (width - 1) * conv_elems;
+    // BUGFIX: clamp i to conv_elems. Without this, the last group writes past conv_elems
+    // and silently overwrites the adjacent ssm_state region in the KV cache padded layout
+    // (conv and ssm share storage; ssm starts at offset conv_elems). This corrupted
+    // ssm_state head 0 elements 0..511, manifesting only on chunk-2 (has_initial_state=True).
+    // Authors: Wenjun + Claude (collaborative debugging)
+    const int i_end = (local_group_id + 1) * elems_per_group;
     for (int i = elems_start_offset_group + local_id;
-         i < (local_group_id + 1) * elems_per_group;
+         i < i_end && i < conv_elems;
          i += group_size) {
       conv_states_ptr[width_id * conv_elems + i] =
           conv_states_tmp_ptr[width_id * conv_elems + i];

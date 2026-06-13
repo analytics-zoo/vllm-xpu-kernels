@@ -121,6 +121,16 @@ CUTE_DEVICE void chunk_prepare_kernel(
   int chunk_id = total_sg_id % chunk_range;
   const int v_head_id = total_sg_id / chunk_range;
 
+  // Fix (OOB write): total_sg_range = sm_count * (threads/sg) is NOT a multiple
+  // of num_v_heads, so chunk_range = total_sg_range/num_v_heads truncates and
+  // the top range of total_sg_id yields v_head_id >= num_v_heads. Those excess
+  // work-items would index a[... + v_head_id*total_virtual_seqlen] past the end
+  // of the buffer (and A_log[v_head_id] out of range), corrupting adjacent GPU
+  // memory (e.g. in_proj_qkvz.weight). They have no legitimate work -> bail.
+  if (v_head_id >= num_v_heads) {
+    return;
+  }
+
   const float A_log_exp_h = -sycl::exp(A_log[v_head_id]);
   const float dt_bias_h = static_cast<float>(dt_bias[v_head_id]);
 
@@ -150,10 +160,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
             a[(chunk_start_offset + sg_local_id * local_num + c) +
               v_head_id * total_virtual_seqlen];
       }
+      // Relative position within this batch of the chunk we're processing.
+      // chunk_id is a global chunk id (cumulative across batches), pre_chunks
+      // is the batch's starting global chunk id, so (chunk_id - pre_chunks)
+      // gives the intra-batch chunk index.
+      const int batch_chunk_idx = chunk_id - pre_chunks;
       CUTE_UNROLL
       for (int c = 0; c < local_num; ++c) {
-        float a_h = g_local[c] + dt_bias_h;
-        a_h = act_softplus(a_h) * A_log_exp_h;
+        // Absolute position within this batch's logical sequence.
+        const int rel_pos =
+            batch_chunk_idx * chunk_size + sg_local_id * local_num + c;
+        // Fix B2: padding positions (rel_pos >= seq_len) MUST get a_h = 0
+        // so that downstream chunk_compute_A_kernel's
+        //     A[m,n] *= exp(g[m]-g[n]) * beta
+        // does not produce `0 * inf = NaN` for padding rows/cols.
+        //   g[padding] = cumsum(softplus(dt_bias) * -exp(A_log)) is a large
+        //   negative, so exp(g[m]-g[n]) for m<n overflows to inf; combined
+        //   with beta=0 (padding) it yields NaN in fp32 accumulator, which
+        //   leaks through to A's m>n padding entries that are not masked to
+        //   zero by the "if (m < n) A = 0" guard.
+        // Setting a_h = 0 here makes g[padding] = 0, so exp(0) = 1 and
+        // 1 * 0 = 0 cleanly.
+        float a_h;
+        if (rel_pos >= seq_len) {
+          a_h = 0.0f;
+        } else {
+          a_h = g_local[c] + dt_bias_h;
+          a_h = act_softplus(a_h) * A_log_exp_h;
+        }
         g_local[c] = a_h;
         g_local_sum += a_h;
       }
@@ -309,6 +343,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
 
         reorder(tSrA_c, tCrA_c);
         copy(copy_A_c, tCrA_c, tCgA_c);
+
+        ::sycl::atomic_fence(::sycl::memory_order::acq_rel,
+                             ::sycl::memory_scope::device);
+        item.barrier(::sycl::access::fence_space::global_and_local);
       }
       chunk_id += global_chunk_range;
     }
@@ -928,6 +966,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     StateT*
         ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
     const int ssm_state_stride_0,
+    float* ssm_state_f32,  // [batch_size, num_v_heads, head_v_dim, head_k_dim]
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
@@ -997,6 +1036,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
         v_head_id * head_v_dim * head_k_dim;
 
+    float* ssm_state_f32_ptr =
+        ssm_state_f32 +
+        static_cast<int64_t>(current_batch_id) * num_v_heads * head_v_dim *
+            head_k_dim +
+        static_cast<int64_t>(v_head_id) * head_v_dim * head_k_dim;
+
+    if (initial_state) {
+      for (int e = local_id; e < head_v_dim * head_k_dim; e += local_range) {
+        ssm_state_f32_ptr[e] = static_cast<float>(ssm_state_ptr[e]);
+      }
+    } else {
+      for (int e = local_id; e < head_v_dim * head_k_dim; e += local_range) {
+        ssm_state_f32_ptr[e] = 0.0f;
+      }
+    }
+    item.barrier(sycl::access::fence_space::global_and_local);
+
     for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
       const bool has_prev_state = (chunk_id != 0) || initial_state;
       const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
@@ -1049,6 +1105,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_gmem_ptr(S_ptr),
           make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
 
+      float* S_f32_ptr = ssm_state_f32_ptr;
+      auto S_f32_tensor = make_tensor(
+          make_gmem_ptr(S_f32_ptr),
+          make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
+
       Tensor cU = make_identity_tensor(U_tensor.shape());
 
       auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
@@ -1084,7 +1145,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           reorder(tCrU_c, tCrU_d);
           copy(copy_U_d, tCrU_d, tCgU_d);
         }
-        item.barrier(sycl::access::fence_space::local_space);
+        ::sycl::atomic_fence(::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+        item.barrier(sycl::access::fence_space::global_and_local);
       }
 
       auto q_ptr =
@@ -1190,29 +1252,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
 
       Tensor cS = make_identity_tensor(S_tensor.shape());
-      auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
+
+      auto copy_S_f32_c = get_block_2d_copy_C<void>(mma, S_f32_tensor);
+      auto copy_S_f32_d = get_block_2d_copy_D<void>(mma, S_f32_tensor);
       auto copy_S_d = get_block_2d_copy_D<void>(mma, S_tensor);
-      auto thr_copy_S_c = copy_S_c.get_slice(local_id);
+
+      auto thr_copy_S_f32_c = copy_S_f32_c.get_slice(local_id);
+      auto thr_copy_S_f32_d = copy_S_f32_d.get_slice(local_id);
       auto thr_copy_S_d = copy_S_d.get_slice(local_id);
 
       for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
         for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
           Tensor gS_C =
               local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
-          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
           auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
           auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
 
-          // Seed accumulator with exp(g_last) * S_prev when previous state
-          // exists; otherwise start from zeros.
           if (has_prev_state) {
-            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
-            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
-            copy(copy_S_c, tCgS_c, tCrS_c);
+            auto tCgS_f32_c = thr_copy_S_f32_c.partition_S(gS_C);
+            auto tCrS_f32_c = thr_copy_S_f32_c.partition_sg_fragment_D(gS_C);
+            copy(copy_S_f32_c, tCgS_f32_c, tCrS_f32_c);
 
-            reorder(tCrS_c, tSrS_d);
+            reorder(tCrS_f32_c, tSrS_d);
             CUTE_UNROLL
-            for (int i = 0; i < tCrS_c.size(); ++i) {
+            for (int i = 0; i < tCrS_f32_c.size(); ++i) {
               tSrS_d(i) *= g_last_value_exp;
             }
           } else {
@@ -1221,7 +1284,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
           gemm_TTS_k_multi(
               U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
-          reorder(tSrS_d, tCrS_d);
+
+          auto tCrS_f32_d = thr_copy_S_f32_d.partition_sg_fragment_S(gS_C);
+          auto tCgS_f32_d = thr_copy_S_f32_d.partition_D(gS_C);
+          reorder(tSrS_d, tCrS_f32_d);
+          copy(copy_S_f32_d, tCrS_f32_d, tCgS_f32_d);
+
+          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
+          CUTE_UNROLL
+          for (int i = 0; i < tCrS_f32_d.size(); ++i) {
+            tCrS_d(i) = static_cast<StateT>(tCrS_f32_d(i));
+          }
           copy(copy_S_d, tCrS_d, tCgS_d);
         }
       }
@@ -1279,6 +1352,7 @@ void kernel_launcher(
     const T* dt_bias,
     StateT* ssm_state,
     const int ssm_state_stride_0,
+    float* ssm_state_f32,
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
@@ -1507,6 +1581,7 @@ void kernel_launcher(
               a,
               ssm_state,
               ssm_state_stride_0,
+              ssm_state_f32,
               query_start_loc,
               cache_indices,
               has_initial_state,
@@ -1583,6 +1658,17 @@ void chunk_gated_delta_rule_impl_xe2(
       {num_v_heads, total_seqlen + padding_size, head_v_dim},
       torch::dtype(dtype).device(device).requires_grad(false));
 
+  torch::Tensor ssm_state_f32 = torch::zeros(
+      {batch_size, num_v_heads, head_v_dim, head_k_dim},
+      torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+
+  // Fix: ensure all torch::zeros memset kernels complete before
+  // launching GDN sub-kernels. On XPU with high memory pressure,
+  // the caching allocator may return buffers whose memset(0) has been
+  // submitted but not completed, causing stale data at offset 0
+  // (v_head_id=0) to corrupt the SSM state recursion.
+  queue.wait();
+
 #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
   kernel_launcher<scalar_t, state_scalar_t>(                       \
       queue,                                                       \
@@ -1599,6 +1685,7 @@ void chunk_gated_delta_rule_impl_xe2(
       reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
       reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
       ssm_state_stride_0,                                          \
+      reinterpret_cast<float*>(ssm_state_f32.data_ptr()),          \
       reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
       reinterpret_cast<int*>(cache_indices.data_ptr()),            \
       has_initial_state.has_value()                                \
