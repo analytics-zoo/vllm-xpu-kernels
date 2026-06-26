@@ -270,7 +270,14 @@ struct FMHAFwdMainloop<
       int thr_id,
       int seq_len,
       int full_tile_offset,
-      bool seq_is_causal = true) {  // per-seq: false => bidirectional
+      bool seq_is_causal = true,  // per-seq: false => bidirectional
+      // True ONLY for a genuine per-sequence bidirectional sequence
+      // (DiffusionGemma: compiled CausalMask=true but per_seq_causal[idx_b]
+      // ==false). For a normal causal sliding-window layer the kernel is
+      // compiled with CausalMask=false, so seq_is_causal is false too, but the
+      // window must stay one-sided (local_right) -- this flag keeps the two
+      // cases apart.
+      bool is_per_seq_bidir = false) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -470,12 +477,14 @@ struct FMHAFwdMainloop<
         Tensor gP = local_tile(
             cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
         auto cS_thread = thr_mma_qk.partition_C(gP);
-        // For a bidirectional sequence (per-seq causal == false) inside a
-        // causal-windowed kernel, the right window is one-sided (local_right
-        // is 0 for causal sliding layers), which would wrongly re-impose
-        // causal masking. Make the window SYMMETRIC for bidirectional seqs by
-        // mirroring local_left on the right.
-        int eff_right = seq_is_causal ? params.local_right : params.local_left;
+        // Symmetrize the window (mirror local_left on the right) ONLY for a
+        // genuine per-sequence bidirectional sequence (DiffusionGemma). A
+        // normal causal sliding-window layer is compiled CausalMask=false, so
+        // seq_is_causal is false as well, but its window is one-sided
+        // (local_right==0) and must NOT be symmetrized -- doing so would drop
+        // causal masking entirely and attend to future tokens.
+        int eff_right =
+            is_per_seq_bidir ? params.local_left : params.local_right;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); ++i) {
           int row_idx = get<0>(cS_thread(i));

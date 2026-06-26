@@ -281,6 +281,12 @@ class XeFMHAFwdKernel {
       const bool seq_is_causal =
           CausalMask &&
           (p.per_seq_causal == nullptr || p.per_seq_causal[idx_b]);
+      // Genuine per-sequence bidirectional sequence: only when a per_seq_causal
+      // mask is actually supplied (DiffusionGemma) AND this sequence is marked
+      // bidirectional. Normal causal sliding-window layers have
+      // per_seq_causal==nullptr and must NOT be treated as bidirectional.
+      const bool is_per_seq_bidir =
+          (p.per_seq_causal != nullptr) && !p.per_seq_causal[idx_b];
 
       // calc sg level seq_len_kv
       const int seq_len =
@@ -370,7 +376,8 @@ class XeFMHAFwdKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          seq_is_causal);
+          seq_is_causal,
+          is_per_seq_bidir);
 
       // return softmax_lse
       if constexpr (SoftmaxLSE) {
