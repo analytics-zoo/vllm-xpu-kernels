@@ -243,6 +243,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
                             cu_seqlens_q.slice(0, 0, batch_size);
     at::Tensor is_prefill_mask = seq_lens_q.gt(1);
     std::optional<const at::Tensor> is_prefill_opt = is_prefill_mask;
+    // Whether the mixed batch actually contains any decode sequence
+    // (seq_len_q == 1). When every sequence is prefill (seq_len_q > 1), the
+    // paged_decode kernel below would launch but skip all batches via its
+    // is_prefill mask -- yet it still requests per-WG SLM proportional to
+    // q_packed (= num_heads_q / num_heads_kv) * head_size_vo. For head_dim=512
+    // with a large GQA group (e.g. gemma-4 full-attn single-card: 16 q-heads /
+    // 1 kv-head), that SLM exceeds the Intel Xe per-WG limit and the launch
+    // fails with UR_RESULT_ERROR_OUT_OF_RESOURCES even though the kernel has no
+    // work to do. Skip the decode launch entirely when there are no decode
+    // sequences (it is a no-op in that case anyway).
+    bool has_decode = (seq_lens_q.numel() > 0) &&
+                      (seq_lens_q.eq(1).any().item<bool>());
 
     cutlass_chunk_prefill_interface(
         queue,
@@ -270,56 +282,58 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_prefill_opt,
         per_seq_causal_);
 
-    // Paged decode: processes only decode batches (skips prefill)
-    int eff_window_left =
-        window_size_left == -1 ? max_seqlen_k : window_size_left;
-    int eff_window_right =
-        window_size_right == -1 ? max_seqlen_k : window_size_right;
-    int effective_seqlen_k =
-        is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
+    if (has_decode) {
+        // Paged decode: processes only decode batches (skips prefill)
+      int eff_window_left =
+          window_size_left == -1 ? max_seqlen_k : window_size_left;
+      int eff_window_right =
+          window_size_right == -1 ? max_seqlen_k : window_size_right;
+      int effective_seqlen_k =
+          is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
 
-    int num_tokens = batch_size;
-    int num_heads_q = q.size(1);
-    int head_dim = q.size(2);
-    int num_heads_kv = k.size(2);
-    int kv_block_size = k.size(1);
+      int num_tokens = batch_size;
+      int num_heads_q = q.size(1);
+      int head_dim = q.size(2);
+      int num_heads_kv = k.size(2);
+      int kv_block_size = k.size(1);
 
-    int num_kv_splits = 1;
-    at::Tensor tmp_out = out;
-    at::Tensor decode_max_logits = at::empty(
-        {num_tokens, num_heads_q, num_kv_splits},
-        q.options().dtype(at::kFloat).device(q.device()));
-    at::Tensor decode_exp_sums = at::empty(
-        {num_tokens, num_heads_q, num_kv_splits},
-        q.options().dtype(at::kFloat).device(q.device()));
+      int num_kv_splits = 1;
+      at::Tensor tmp_out = out;
+      at::Tensor decode_max_logits = at::empty(
+          {num_tokens, num_heads_q, num_kv_splits},
+          q.options().dtype(at::kFloat).device(q.device()));
+      at::Tensor decode_exp_sums = at::empty(
+          {num_tokens, num_heads_q, num_kv_splits},
+          q.options().dtype(at::kFloat).device(q.device()));
 
-    cutlass_paged_decode_interface(
-        queue,
-        q,
-        k,
-        v,
-        out,
-        tmp_out,
-        decode_exp_sums,
-        decode_max_logits,
-        block_table,
-        cu_seqlens_q,
-        seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        k_scale,
-        v_scale,
-        softmax_scale,
-        softmax_sink_,
-        eff_window_left,
-        eff_window_right,
-        is_varlen,
-        is_paged,
-        false,  // is_causal: always false for decode;
-        is_local,
-        is_sink,
-        num_kv_splits,
-        is_prefill_opt);
+      cutlass_paged_decode_interface(
+          queue,
+          q,
+          k,
+          v,
+          out,
+          tmp_out,
+          decode_exp_sums,
+          decode_max_logits,
+          block_table,
+          cu_seqlens_q,
+          seqlens_k,
+          max_seqlen_q,
+          max_seqlen_k,
+          k_scale,
+          v_scale,
+          softmax_scale,
+          softmax_sink_,
+          eff_window_left,
+          eff_window_right,
+          is_varlen,
+          is_paged,
+          false,  // is_causal: always false for decode;
+          is_local,
+          is_sink,
+          num_kv_splits,
+          is_prefill_opt);
+    }
   } else {
     // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
     // In decode phase the window_size_right doesn't have effect

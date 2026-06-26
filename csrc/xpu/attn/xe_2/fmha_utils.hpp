@@ -154,6 +154,22 @@ struct chunk_policy_head512_b16 {
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };
 
+// Cap the per-work-group V (output head_dim) tile at 256 elements. The decode
+// epilogue's cross-SG reduction SLM buffer is sized q_packed * V_tile *
+// SGPerWG * sizeof(float); at head_dim=512 with a large GQA group
+// (q_packed=16) the full-512 V tile needs ~128 KiB, exceeding the Intel Xe
+// per-work-group SLM cap and failing the launch with
+// UR_RESULT_ERROR_OUT_OF_RESOURCES. Capping the V tile at 256 makes the decode
+// tile scheduler emit grid.x = ceil_div(head_size_vo, 256) work-groups (2 for
+// head_dim=512), each owning an independent 256-wide output slice (the V
+// dimension is the output feature axis -> embarrassingly parallel, no cross-WG
+// reduction; softmax over K is recomputed per slice). This mirrors how the
+// chunk_prefill head512 policy splits V via grid.x=2. For head_dim<=256 the cap
+// is a no-op, so smaller head sizes are unchanged.
+template <typename head_dim>
+using decode_v_tile_t =
+    cute::conditional_t<(head_dim::value > 256), _256, head_dim>;
+
 // define decode policy
 template <typename q_packed, typename head_dim, typename kv_tile>
 struct decode_policy_qpacked_head {
@@ -169,7 +185,7 @@ template <typename q_packed, typename head_dim>
 struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
   using ShapeQK = Shape<q_packed, _16, _64>;
   using ShapePV = Shape<q_packed, _32, _16>;
-  using ShapeOut = Shape<q_packed, head_dim>;
+  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
 };
 
@@ -178,7 +194,7 @@ template <typename q_packed, typename head_dim>
 struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
   using ShapeQK = Shape<q_packed, _32, _64>;
   using ShapePV = Shape<q_packed, _32, _32>;
-  using ShapeOut = Shape<q_packed, head_dim>;
+  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
 };
 
@@ -190,7 +206,7 @@ template <typename q_packed, typename head_dim>
 struct decode_policy_qpacked_head<q_packed, head_dim, _64> {
   using ShapeQK = Shape<q_packed, _64, _64>;
   using ShapePV = Shape<q_packed, _32, _64>;
-  using ShapeOut = Shape<q_packed, head_dim>;
+  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
 };
 
@@ -206,6 +222,6 @@ template <typename q_packed, typename head_dim>
 struct decode_policy_qpacked_head<q_packed, head_dim, _128> {
   using ShapeQK = Shape<q_packed, _128, _64>;
   using ShapePV = Shape<q_packed, _32, _128>;
-  using ShapeOut = Shape<q_packed, head_dim>;
+  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
 };
