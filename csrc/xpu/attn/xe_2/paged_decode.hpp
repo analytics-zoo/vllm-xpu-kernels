@@ -138,6 +138,18 @@ struct paged_decode_args_t {
   int64_t q_stride_batch = 0;
 };
 
+// XPU-graph-safe kernel entry: receives the SLM block as an explicit char* (a
+// sycl::local_accessor allocated by the launch layer when a compat::local_mem_size
+// is supplied), instead of cutlass::device_kernel which fetches
+// work_group_scratch_memory (un-capturable by SYCL command graph). A dedicated
+// free function (not an overload of cutlass::device_kernel) keeps the
+// `launch<auto F>` non-type template-parameter unambiguous.
+template <typename Op>
+void paged_decode_graph_safe_kernel(typename Op::Params params, char* smem) {
+  Op op;
+  op(params, smem);
+}
+
 template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
 struct DecodeKernelLauncher {
   using StrideQ = typename FMHAKernel::StrideQ;
@@ -399,16 +411,18 @@ struct DecodeKernelLauncher {
     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    // Launch parameters depend on whether SYCL compiler supports work-group
-    // scratch memory extension
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
+    // XPU-graph: use a static local_accessor (compat::local_mem_size) instead
+    // of work_group_scratch_size. The scratch-memory extension cannot be
+    // captured by a SYCL command graph; local_accessor (SLM) can. The launch
+    // layer allocates a sycl::local_accessor of smem_size bytes and calls the
+    // device_kernel(params, local_ptr<char>) overload. smem_size ==
+    // FMHAKernel::SharedStorageSize is a compile-time constant.
     compat::experimental::kernel_properties kernel_props{
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{
-        sycl_grid, sycl_block, launch_props, kernel_props};
-    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+        sycl_grid, sycl_block, kernel_props,
+        compat::experimental::local_mem_size(smem_size)};
+    compat::experimental::launch<paged_decode_graph_safe_kernel<FMHAKernel>>(
         policy, queue, params);
 
     // event.wait();
@@ -420,17 +434,14 @@ struct DecodeKernelLauncher {
       const auto reduce_sycl_block = compat::dim3(block.x, block.y, block.z);
       const auto reduce_sycl_grid =
           compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
-      compat::experimental::launch_properties launch_props_reduce{
-          syclex::work_group_scratch_size(reduce_smem_size),
-      };
       compat::experimental::launch_policy reduce_policy{
           reduce_sycl_grid,
           reduce_sycl_block,
-          launch_props_reduce,
-          kernel_props};
+          kernel_props,
+          compat::experimental::local_mem_size(reduce_smem_size)};
 
       compat::experimental::launch<
-          cutlass::device_kernel<ReductionSplitKernel>>(
+          paged_decode_graph_safe_kernel<ReductionSplitKernel>>(
           reduce_policy, queue, reduce_params);
       // reduce_event.wait();
     }
