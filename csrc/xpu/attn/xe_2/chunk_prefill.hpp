@@ -81,6 +81,17 @@ struct chunk_prefill_args_t {
   void* per_seq_causal = nullptr;
 };
 
+// XPU-graph-safe kernel entry: receives the SLM block as an explicit char* (a
+// sycl::local_accessor allocated by the launch layer when a compat::local_mem_size
+// is supplied), instead of cutlass::device_kernel which fetches
+// work_group_scratch_memory (un-capturable by SYCL command graph). A dedicated
+// free function keeps the launch<auto F> non-type template parameter unambiguous.
+template <typename Op>
+void chunk_prefill_graph_safe_kernel(typename Op::Params params, char* smem) {
+  Op op;
+  op(params, smem);
+}
+
 template <class FMHAKernel, bool isVarLen>
 struct KernelLauncher {
   using StrideQ = typename FMHAKernel::StrideQ;
@@ -224,16 +235,16 @@ struct KernelLauncher {
     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    // Launch parameters depend on whether SYCL compiler supports work-group
-    // scratch memory extension
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
+    // XPU-graph: static local_accessor (compat::local_mem_size) instead of
+    // work_group_scratch_size so the prefill/chunk-prefill kernel is
+    // SYCL-command-graph-capturable. SLM size == FMHAKernel::SharedStorageSize
+    // (compile-time constant). Mirrors paged_decode.hpp; kernel body unchanged.
     compat::experimental::kernel_properties kernel_props{
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{
-        sycl_grid, sycl_block, launch_props, kernel_props};
-    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+        sycl_grid, sycl_block, kernel_props,
+        compat::experimental::local_mem_size(smem_size)};
+    compat::experimental::launch<chunk_prefill_graph_safe_kernel<FMHAKernel>>(
         policy, queue, params);
   }
 };
