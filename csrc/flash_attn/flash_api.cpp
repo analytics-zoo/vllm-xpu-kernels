@@ -253,8 +253,23 @@ std::vector<at::Tensor> mha_varlen_fwd(
     // fails with UR_RESULT_ERROR_OUT_OF_RESOURCES even though the kernel has no
     // work to do. Skip the decode launch entirely when there are no decode
     // sequences (it is a no-op in that case anyway).
-    bool has_decode = (seq_lens_q.numel() > 0) &&
-                      (seq_lens_q.eq(1).any().item<bool>());
+    // The .item<bool>() probe forces a device->host read, which makes SYCL
+    // wait on the queue ("wait method cannot be used for an event associated
+    // with a command graph") and aborts during SYCL-command-graph capture.
+    // Skip the probe only while the queue is recording a graph AND on the
+    // DiffusionGemma fused per-seq-causal path (per_seq_causal_ set): that path
+    // captures uniform multi-token (canvas) batches with no seq_len_q==1 decode
+    // sequence, so has_decode is false for the captured shape. In eager
+    // execution (queue not recording) the full probe still runs, preserving
+    // correctness for mixed batches that contain a seq_len_q==1 sequence; all
+    // other paths are unaffected.
+    bool capturing = queue.ext_oneapi_get_state() ==
+                     sycl::ext::oneapi::experimental::queue_state::recording;
+    bool has_decode = false;
+    if (!(capturing && per_seq_causal_.has_value())) {
+      has_decode = (seq_lens_q.numel() > 0) &&
+                   (seq_lens_q.eq(1).any().item<bool>());
+    }
 
     cutlass_chunk_prefill_interface(
         queue,
