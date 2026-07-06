@@ -203,7 +203,16 @@ void gdn_attention(
         "num_accepted_tokens size must be num_spec_decodes");
   }
 
-  TORCH_CHECK(spec_token == num_spec_decodes * (num_speculative_tokens + 1));
+  // NOTE: spec_token need NOT equal num_spec_decodes*(num_speculative_tokens+1).
+  // The scheduler produces ragged spec batches: when a request accepts 0 draft
+  // tokens (num_accepted_tokens==0 -> num_decode_draft_tokens==-1) or the batch
+  // is otherwise short, gdn_attn.py deliberately truncates spec_token_indx via
+  // min(num_spec_decodes*(n+1), query_start_loc[-1]). The CUDA reference kernel
+  // (gdn_linear_attn.py forward_cuda) has no such rectangular assumption -- it
+  // index_selects by the actual spec_token_indx length. The sub-kernels here
+  // (causal_conv1d / gated_delta_rule) likewise walk per-request ranges via
+  // spec_query_start_loc, so a short spec region is handled correctly. Only the
+  // conservation check below is required.
   TORCH_CHECK(non_spec_token + spec_token == num_actual_tokens);
 
   // check core_attn_out / z / projected_states_{qkvz,ba} shapes.
