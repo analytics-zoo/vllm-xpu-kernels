@@ -575,6 +575,13 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
         }
       }
 
+      // The block-recursive inverse below immediately consumes the four
+      // diagonal blocks updated above.  These scalar stores target global
+      // memory, so make them visible before the first block-2D load.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
+
       auto A_ptr_11 = A_ptr;
 
       auto A_ptr_21 = A_ptr + 16 * chunk_size;
@@ -676,6 +683,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       reorder(tCrC, tCrD_21);
       copy(copy_D_21, tCrD_21, tCgD_21);
 
+      // A_21 is read by the A_31/A_41 updates below.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
+
       auto copy_D_31 = get_block_2d_copy_D<void>(mma, A_31_tensor);
       auto thr_copy_D_31 = copy_D_31.get_slice(local_id);
       auto tCrD_31 = thr_copy_D_31.partition_sg_fragment_S(gC);
@@ -685,6 +697,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       gemm_TTS(A_32_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
       reorder(tCrC, tCrD_31);
       copy(copy_D_31, tCrD_31, tCgD_31);
+
+      // The next GEMM reloads the just-written intermediate A_31.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
       clear(tCrC);
       gemm_TTS(A_33_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
       CUTE_UNROLL
@@ -693,6 +710,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       }
       reorder(tCrC, tCrD_31);
       copy(copy_D_31, tCrD_31, tCgD_31);
+
+      // The A_41 update consumes the final A_31 value.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
 
       auto copy_D_41 = get_block_2d_copy_D<void>(mma, A_41_tensor);
       auto thr_copy_D_41 = copy_D_41.get_slice(local_id);
@@ -704,6 +726,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       gemm_TTS(A_43_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
       reorder(tCrC, tCrD_41);
       copy(copy_D_41, tCrD_41, tCgD_41);
+
+      // The next GEMM reloads the just-written intermediate A_41.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
       clear(tCrC);
       gemm_TTS(A_44_tensor, A_41_tensor_T, tCrC, 0, 0, mma);
       CUTE_UNROLL
@@ -729,6 +756,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       reorder(tCrC, tCrD_32);
       copy(copy_D_32, tCrD_32, tCgD_32);
 
+      // A_32 is read by the A_42 update below.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
+
       auto copy_D_42 = get_block_2d_copy_D<void>(mma, A_42_tensor);
       auto thr_copy_D_42 = copy_D_42.get_slice(local_id);
       auto tCrD_42 = thr_copy_D_42.partition_sg_fragment_S(gC);
@@ -738,6 +770,11 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
       gemm_TTS(A_43_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
       reorder(tCrC, tCrD_42);
       copy(copy_D_42, tCrD_42, tCgD_42);
+
+      // The next GEMM reloads the just-written intermediate A_42.
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
       clear(tCrC);
       gemm_TTS(A_44_tensor, A_42_tensor_T, tCrC, 0, 0, mma);
       CUTE_UNROLL
@@ -1331,6 +1368,15 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }
+
+      // The next chunk consumes both S_f32_tensor and S_tensor written above.
+      // Block-2D stores may still be outstanding when an early subgroup loops
+      // back, and the loop-head SLM barrier does not order global memory. Make
+      // the recurrent-state update visible to every subgroup before any of
+      // them starts the next chunk (or lets the kernel complete).
+      ::sycl::atomic_fence(
+          ::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
+      item.barrier(::sycl::access::fence_space::global_and_local);
     }
     pre_chunks += current_chunks;
   }
