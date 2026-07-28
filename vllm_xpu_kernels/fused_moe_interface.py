@@ -65,7 +65,7 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
                              num_rows_per_expert, n, k, num_experts, is_B_int4,
-                             is_B_mxfp4):
+                             is_B_mxfp4, is_B_fp8_block=False):
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_B=input_B,
@@ -77,7 +77,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         K=k,
         num_experts=num_experts,
         is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        is_B_mxfp4=is_B_mxfp4,
+        is_B_fp8_block=is_B_fp8_block)
 
 
 def ceilDiv(a, b):
@@ -308,12 +309,12 @@ class XpuFusedMoe:
         is_mxfp8=False,
         is_block_fp8=False
     ):
-        # 4bits support [E, N, K]
-        # other types [E, K, N]
-        if not is_int4 and not is_mxfp4:
-            self.inter_size = w13.shape[-1] // 2
-        else:
+        # Quantized block/group formats use [E, N, K]; other types use
+        # [E, K, N].
+        if is_int4 or is_mxfp4 or is_block_fp8:
             self.inter_size = w13.shape[-2] // 2
+        else:
+            self.inter_size = w13.shape[-1] // 2
 
         assert w13.is_contiguous() and w2.is_contiguous()
 
@@ -333,7 +334,7 @@ class XpuFusedMoe:
         self.w13 = w13
         self.w2 = w2
 
-        if not is_fp8 and not is_int4 and not is_mxfp4:
+        if not is_fp8 and not is_block_fp8 and not is_int4 and not is_mxfp4:
             self.gemm1_scales = None
             self.gemm2_scales = None
         else:
@@ -487,7 +488,8 @@ class XpuFusedMoe:
             K=hidden_size,
             num_experts=self.num_experts,
             is_B_int4=self.is_int4,
-            is_B_mxfp4=self.is_mxfp4)
+            is_B_mxfp4=self.is_mxfp4,
+            is_B_fp8_block=self.is_block_fp8)
 
         # act
         act_output = torch.empty(
@@ -512,7 +514,8 @@ class XpuFusedMoe:
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts,
             is_B_int4=self.is_int4,
-            is_B_mxfp4=self.is_mxfp4)
+            is_B_mxfp4=self.is_mxfp4,
+            is_B_fp8_block=self.is_block_fp8)
 
         torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                     unpermuted_row_to_permuted_row,
@@ -589,12 +592,11 @@ def xpu_fused_moe(hidden_states,
         output.copy_(out)
         return output
 
-    # 4bits support [E, N, K]
-    # other types [E, K, N]
-    if not is_int4 and not is_mxfp4:
-        inter_size = list(w13.shape)[-1] // 2
-    else:
+    # Quantized block/group formats use [E, N, K]; other types use [E, K, N].
+    if is_int4 or is_mxfp4 or is_block_fp8:
         inter_size = list(w13.shape)[-2] // 2
+    else:
+        inter_size = list(w13.shape)[-1] // 2
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
@@ -617,7 +619,7 @@ def xpu_fused_moe(hidden_states,
                                dtype=hidden_states.dtype,
                                device=hidden_states.device)
 
-    if not is_fp8 and not is_int4 and not is_mxfp4:
+    if not is_fp8 and not is_block_fp8 and not is_int4 and not is_mxfp4:
         gemm1_scales = None
         gemm2_scales = None
     else:
@@ -675,7 +677,8 @@ def xpu_fused_moe(hidden_states,
         K=hidden_size,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        is_B_fp8_block=is_block_fp8)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     # act
@@ -702,7 +705,8 @@ def xpu_fused_moe(hidden_states,
         K=inter_size * inter_size_scale,
         num_experts=num_experts,
         is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        is_B_mxfp4=is_mxfp4,
+        is_B_fp8_block=is_block_fp8)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,
