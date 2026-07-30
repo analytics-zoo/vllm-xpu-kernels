@@ -230,6 +230,51 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
     torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES)
+@pytest.mark.parametrize(
+    "scale_dtype", [torch.float32, torch.bfloat16, torch.float16]
+)
+def test_fp8_gemm_w8a16_block_scale(out_dtype, scale_dtype):
+    torch.manual_seed(1234)
+    m, n, k, group_size = 17, 256, 512, 128
+
+    input = torch.randn(m, k, dtype=out_dtype, device="xpu") / 10.0
+    weight = torch.randn(n, k, dtype=out_dtype, device="xpu") / 10.0
+    weight_fp8 = weight.to(torch.float8_e4m3fn)
+    scales_nk = (
+        torch.rand(
+            n // group_size,
+            k // group_size,
+            dtype=torch.float32,
+            device="xpu",
+        )
+        / 100.0
+        + 0.001
+    )
+    scales_kn = scales_nk.to(scale_dtype).t().contiguous()
+
+    output = fp8_gemm_w8a16(
+        input,
+        weight_fp8.t(),
+        scales_kn,
+        None,
+        group_size,
+    )
+    expanded_scales = scales_nk.repeat_interleave(
+        group_size, 0
+    ).repeat_interleave(group_size, 1)
+    reference = input.float() @ (
+        weight_fp8.float() * expanded_scales.to(scale_dtype).float()
+    ).t()
+
+    torch.testing.assert_close(
+        output.float(),
+        reference,
+        atol=5e-3,
+        rtol=5e-3,
+    )
+
+
 def _convert_to_mxfp8_with_hp_ref(t):
     # Convert a tensor to mxfp8, returning:
     #   t_hp : reconstructed bf16 version of t_lp

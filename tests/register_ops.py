@@ -354,8 +354,10 @@ def fp4_gemm(
 
 def fp8_gemm_w8a16(input: torch.Tensor, weight: torch.Tensor,
                    scale_wei: Optional[torch.Tensor],
-                   scale_act: Optional[torch.Tensor]):
-    return torch.ops._xpu_C.fp8_gemm_w8a16(input, weight, scale_wei, scale_act)
+                   scale_act: Optional[torch.Tensor],
+                   group_size: int = 0):
+    return torch.ops._xpu_C.fp8_gemm_w8a16(
+        input, weight, scale_wei, scale_act, group_size)
 
 
 # moe
