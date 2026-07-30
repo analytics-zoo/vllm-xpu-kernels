@@ -82,19 +82,48 @@ torch::Tensor fp8_gemm_w8a16(
     const torch::Tensor& A,
     const torch::Tensor& B,
     const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_) {
+    const std::optional<torch::Tensor>& bias_,
+    int64_t group_size) {
   const at::DeviceGuard device_guard(A.device());
   torch::Tensor result = check_and_create_output_tensor(A, B, A.scalar_type());
   TORCH_CHECK(
       is_supported_fp8(B.scalar_type()),
       "weight must be f8_e5m2 or f8_e4m3fn for fp8 matmul");
+  TORCH_CHECK(group_size >= 0, "group_size must be non-negative");
+  if (group_size > 0) {
+    TORCH_CHECK(
+        B_scale_.has_value(),
+        "grouped FP8 weight scales must be provided");
+    TORCH_CHECK(
+        B.dim() == 2 && B.size(0) % group_size == 0 &&
+            B.size(1) % group_size == 0,
+        "grouped FP8 weight dimensions must be divisible by group_size");
+    TORCH_CHECK(
+        B_scale_->dim() == 2 &&
+            B_scale_->size(0) == B.size(0) / group_size &&
+            B_scale_->size(1) == B.size(1) / group_size,
+        "grouped FP8 weight scales must have shape "
+        "[K / group_size, N / group_size]");
+    TORCH_CHECK(
+        B_scale_->is_contiguous(),
+        "grouped FP8 weight scales must be contiguous");
+    TORCH_CHECK(
+        B_scale_->device() == B.device(),
+        "grouped FP8 weight scales and weight must be on the same device");
+    TORCH_CHECK(
+        B_scale_->scalar_type() == at::kFloat ||
+            B_scale_->scalar_type() == at::kBFloat16 ||
+            B_scale_->scalar_type() == at::kHalf,
+        "grouped FP8 weight scales must be float32, bfloat16, or float16");
+  }
   // check if nt format
   bool is_nt = B.strides()[B.dim() - 2] == 1;
 
   torch::Tensor B_scale = B_scale_.has_value()
                               ? B_scale_.value()
                               : at::ones({1}, B.options().dtype(A.dtype()));
-  oneDNN::dnnl_matmul_w8a16_fp8(result, A, B, is_nt, bias_, B_scale);
+  oneDNN::dnnl_matmul_w8a16_fp8(
+      result, A, B, is_nt, bias_, B_scale, group_size);
   return result;
 }
 
