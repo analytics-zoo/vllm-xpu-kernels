@@ -6,8 +6,12 @@ import torch
 
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.utils import format_tc, seed_everything
-from vllm_xpu_kernels.fused_moe_interface import (cutlass_grouped_gemm,
-                                                  cutlass_grouped_gemm_xe2)
+from vllm_xpu_kernels.fused_moe_interface import (
+    cutlass_grouped_gemm,
+    cutlass_grouped_gemm_xe2,
+    fp8_block_dequant_xe2,
+    fp8_block_gemm_xe2,
+)
 
 DEVICE = "xpu"
 
@@ -269,6 +273,49 @@ def test_xe_grouped_gemm_fp8_block_qwen_shape(n, k):
         row_start += expert_rows
 
     torch.testing.assert_close(output, reference, rtol=8e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("m,n,k", [(16, 256, 128), (257, 256, 512)])
+def test_xe_dense_gemm_fp8_block(dtype, m, n, k):
+    seed_everything(7)
+    input_a = (torch.randn(m, k, device=DEVICE) * 0.3).to(dtype)
+    scales = (
+        torch.rand(n // 128, k // 128, device=DEVICE) * 0.015 + 0.005
+    ).float()
+    expanded_scales = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    source = torch.randn(n, k, device=DEVICE) * 0.08
+    input_b = (source / expanded_scales).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    )
+
+    output = fp8_block_gemm_xe2(input_a, input_b, scales)
+    reference = input_a.float() @ (
+        input_b.float() * expanded_scales
+    ).transpose(0, 1)
+
+    assert output.dtype == dtype
+    torch.testing.assert_close(
+        output.float(), reference, rtol=8e-2, atol=2e-1
+    )
+
+
+def test_xe_fp8_block_dequant():
+    seed_everything(7)
+    n, k = 256, 512
+    scales = (
+        torch.rand(n // 128, k // 128, device=DEVICE) * 0.015 + 0.005
+    ).float()
+    expanded_scales = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    source = torch.randn(n, k, device=DEVICE) * 0.08
+    input_b = (source / expanded_scales).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    )
+
+    output = fp8_block_dequant_xe2(input_b, scales)
+    reference = (input_b.float() * expanded_scales).half()
+
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
 def test_xe_grouped_gemm_fp8_block_all_finite_e4m3():

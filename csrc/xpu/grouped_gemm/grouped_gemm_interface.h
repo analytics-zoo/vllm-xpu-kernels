@@ -13,3 +13,12 @@ torch::Tensor cutlass_grouped_gemm_interface(
     bool is_B_int4,
     bool is_B_mxfp4,
     bool is_B_fp8_block);
+
+torch::Tensor fp8_block_gemm_xe2_interface(
+    const torch::Tensor& ptr_A,
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales);
+
+torch::Tensor fp8_block_dequant_xe2_interface(
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales);

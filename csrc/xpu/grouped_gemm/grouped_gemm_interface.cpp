@@ -70,3 +70,37 @@ torch::Tensor cutlass_grouped_gemm_interface(
 #endif
   }
 }
+
+torch::Tensor fp8_block_gemm_xe2_interface(
+    const torch::Tensor& ptr_A,
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales) {
+  TORCH_CHECK(
+      vllm::xpu::is_xe2_arch(ptr_A.device().index()),
+      "FP8 block-scaled dense GEMM requires an Xe2 device");
+  TORCH_CHECK(
+      !vllm::xpu::force_xe_default_kernel(),
+      "FP8 block-scaled dense GEMM does not support the forced XE default "
+      "kernel");
+#ifdef VLLM_XPU_ENABLE_XE2
+  return fp8_block_gemm_xe2(ptr_A, ptr_B, ptr_scales);
+#else
+  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+#endif
+}
+
+torch::Tensor fp8_block_dequant_xe2_interface(
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales) {
+  TORCH_CHECK(
+      vllm::xpu::is_xe2_arch(ptr_B.device().index()),
+      "FP8 block dequantization requires an Xe2 device");
+  TORCH_CHECK(
+      !vllm::xpu::force_xe_default_kernel(),
+      "FP8 block dequantization does not support the forced XE default kernel");
+#ifdef VLLM_XPU_ENABLE_XE2
+  return fp8_block_dequant_xe2(ptr_B, ptr_scales);
+#else
+  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+#endif
+}

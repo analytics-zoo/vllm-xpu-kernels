@@ -37,10 +37,13 @@
 #include "csrc/utils.h"
 
 #include <cute/tensor.hpp>
+#include <limits>
 #include <random>
 
 #include <cute/util/compat.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cute/tensor.hpp>
@@ -66,6 +69,135 @@ using namespace cute;
 // type tag to define a unique sycl kernel name
 template <typename, typename, typename, typename, char, char, class>
 class GemmCuteName;
+
+template <typename, class>
+class DenseFp8BlockGemmCuteName;
+
+class Fp8BlockDequantXe2Name;
+
+void Fp8BlockDequantLauncher(
+    sycl::queue& stream,
+    const float_e4m3_t* weights,
+    const float* scales,
+    half_t* output,
+    int64_t gemm_n,
+    int64_t gemm_k) {
+  namespace esimd = sycl::ext::intel::esimd;
+  namespace xmem = sycl::ext::intel::experimental::esimd;
+  constexpr int block_size = 128;
+  const int64_t blocks_k = gemm_k / block_size;
+  const int64_t row_segments = gemm_n * blocks_k;
+
+  stream.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<Fp8BlockDequantXe2Name>(
+        sycl::range<1>(row_segments),
+        [=](sycl::id<1> item) SYCL_ESIMD_KERNEL {
+          const int64_t segment = item[0];
+          const int64_t row = segment / blocks_k;
+          const int64_t block_k = segment % blocks_k;
+          const int64_t block_id = (row / block_size) * blocks_k + block_k;
+          const float scale = scales[block_id];
+          const int64_t index = row * gemm_k + block_k * block_size;
+          auto bytes = xmem::lsc_block_load<
+              uint8_t,
+              block_size,
+              xmem::lsc_data_size::default_size,
+              xmem::cache_hint::streaming,
+              xmem::cache_hint::cached>(
+              reinterpret_cast<const uint8_t*>(weights) + index);
+
+          esimd::simd<uint16_t, block_size> fp8 = 0;
+          fp8.template bit_cast_view<uint8_t>()
+              .template select<block_size, 2>(0) = bytes;
+          esimd::simd<uint16_t, block_size> bits = (fp8 & 0x7f) << 7;
+          bits += 0x2000;
+          bits |= (fp8 & 0x80) << 8;
+
+          const auto sign = (fp8 & 0x80) << 8;
+          const auto mantissa = fp8 & 0x07;
+          const auto subnormal = (fp8 & 0x78) == 0;
+          bits.merge(sign, subnormal && mantissa == 0);
+          bits.merge(sign | 0x1800, subnormal && mantissa == 1);
+          bits.merge(sign | 0x1c00, subnormal && mantissa == 2);
+          bits.merge(sign | 0x1e00, subnormal && mantissa == 3);
+          bits.merge(sign | 0x2000, subnormal && mantissa == 4);
+          bits.merge(sign | 0x2100, subnormal && mantissa == 5);
+          bits.merge(sign | 0x2200, subnormal && mantissa == 6);
+          bits.merge(sign | 0x2300, subnormal && mantissa == 7);
+          bits.merge(sign | 0x7e00, (fp8 & 0x7f) == 0x7f);
+
+          esimd::simd<sycl::half, block_size> values =
+              bits.template bit_cast_view<sycl::half>();
+          esimd::simd<float, block_size> scaled = values;
+          scaled *= scale;
+          xmem::lsc_block_store<
+              sycl::half,
+              block_size,
+              xmem::lsc_data_size::default_size,
+              xmem::cache_hint::streaming,
+              xmem::cache_hint::write_back>(
+              reinterpret_cast<sycl::half*>(output) + index,
+              esimd::simd<sycl::half, block_size>(scaled));
+        });
+  });
+}
+
+template <typename ElementA, class policy>
+void DenseFp8BlockGEMMLauncher(
+    sycl::queue& stream,
+    const ElementA* activations,
+    const float_e4m3_t* weights,
+    const float* scales,
+    ElementA* outputs,
+    int gemm_m,
+    int gemm_n,
+    int gemm_k) {
+  auto op = XE_DPAS_TT<8, float, ElementA>{};
+  using WGTile = typename policy::WGTile;
+  using SGLayout = typename policy::SGLayout;
+  using MMA = typename TiledMMAHelper<
+      MMA_Atom<decltype(op)>,
+      Layout<WGTile>,
+      SGLayout>::TiledMMA;
+  auto mma = MMA{};
+
+  const int threads_per_workgroup = size(mma);
+  const int tiles_m = ceil_div(gemm_m, int(size<0>(WGTile{})));
+  const int tiles_n = ceil_div(gemm_n, int(size<1>(WGTile{})));
+  sycl::range<3> local(1, 1, threads_per_workgroup);
+  sycl::range<3> global(1, tiles_m * tiles_n, 1);
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties kernel_props{
+      syclex::sub_group_size<16>, intelex::grf_size<256>};
+
+  using GmemTiledCopyA = typename policy::GmemTiledCopyA;
+  using GmemTiledCopyB = typename policy::GmemTiledCopyB;
+  using GmemTiledCopyD = typename policy::GmemTiledCopyD;
+
+  stream.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<DenseFp8BlockGemmCuteName<ElementA, policy>>(
+        sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto item) {
+          const int tile_id = item.get_group_linear_id();
+          const int tile_m = tile_id / tiles_n;
+          const int tile_n = tile_id % tiles_n;
+          auto A = make_moe_tensor<ElementA, 'R'>(
+              const_cast<ElementA*>(activations), gemm_m, gemm_k);
+          auto B = make_moe_tensor<float_e4m3_t, 'R'>(
+              const_cast<float_e4m3_t*>(weights), gemm_n, gemm_k);
+          auto D = make_moe_tensor<ElementA, 'R'>(
+              outputs, gemm_m, gemm_n);
+          auto tile_coord = make_coord(tile_m, tile_n, _, 0);
+          xe_gemm_4bits<
+              GmemTiledCopyA,
+              GmemTiledCopyB,
+              GmemTiledCopyD,
+              128>(A, B, scales, static_cast<ElementA*>(nullptr), D,
+                   tile_coord, mma);
+        });
+  });
+}
 
 template <
     char layoutA,
@@ -401,5 +533,120 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   }
 #undef MoEGEMMLauncherCallER
   return ptr_D;
+}
+
+at::Tensor fp8_block_gemm_xe2_impl(
+    const at::Tensor& ptr_A,
+    const at::Tensor& ptr_B,
+    const at::Tensor& ptr_scales) {
+  TORCH_CHECK(
+      ptr_A.scalar_type() == at::kHalf ||
+          ptr_A.scalar_type() == at::kBFloat16,
+      "activation must be float16 or bfloat16");
+  TORCH_CHECK(
+      ptr_B.scalar_type() == at::kFloat8_e4m3fn,
+      "weight must be float8_e4m3fn");
+  TORCH_CHECK(
+      ptr_scales.scalar_type() == at::kFloat,
+      "weight scales must be float32");
+  TORCH_CHECK(ptr_A.dim() == 2, "activation must be 2D [M, K]");
+  TORCH_CHECK(ptr_B.dim() == 2, "weight must be 2D [N, K]");
+  TORCH_CHECK(
+      ptr_scales.dim() == 2,
+      "weight scales must be 2D [N / 128, K / 128]");
+  TORCH_CHECK(
+      ptr_A.device() == ptr_B.device() &&
+          ptr_A.device() == ptr_scales.device(),
+      "activation, weight, and scales must be on the same device");
+  TORCH_CHECK(
+      ptr_A.is_contiguous() && ptr_B.is_contiguous() &&
+          ptr_scales.is_contiguous(),
+      "activation, weight, and scales must be contiguous");
+
+  const int64_t M = ptr_A.size(0);
+  const int64_t K = ptr_A.size(1);
+  const int64_t N = ptr_B.size(0);
+  TORCH_CHECK(ptr_B.size(1) == K, "activation and weight K dimensions differ");
+  TORCH_CHECK(
+      N % 256 == 0 && K % 128 == 0,
+      "N must be divisible by 256 and K must be divisible by 128");
+  constexpr int64_t max_int = std::numeric_limits<int>::max();
+  TORCH_CHECK(
+      M <= max_int && N <= max_int && K <= max_int &&
+          M * K <= max_int && N * K <= max_int && M * N <= max_int,
+      "dense FP8 block GEMM requires dimensions and tensor element counts "
+      "to fit in 32-bit indexing");
+  TORCH_CHECK(
+      ptr_scales.size(0) == N / 128 &&
+          ptr_scales.size(1) == K / 128,
+      "weight scales must have shape [N / 128, K / 128]");
+
+  auto output = at::empty({M, N}, ptr_A.options());
+  auto& queue = at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
+  using policy = dense_w8a16_policy;
+  if (ptr_A.scalar_type() == at::kHalf) {
+    DenseFp8BlockGEMMLauncher<half_t, policy>(
+        queue,
+        reinterpret_cast<const half_t*>(ptr_A.data_ptr()),
+        reinterpret_cast<const float_e4m3_t*>(ptr_B.data_ptr()),
+        reinterpret_cast<const float*>(ptr_scales.data_ptr()),
+        reinterpret_cast<half_t*>(output.data_ptr()),
+        M,
+        N,
+        K);
+  } else {
+    DenseFp8BlockGEMMLauncher<bfloat16_t, policy>(
+        queue,
+        reinterpret_cast<const bfloat16_t*>(ptr_A.data_ptr()),
+        reinterpret_cast<const float_e4m3_t*>(ptr_B.data_ptr()),
+        reinterpret_cast<const float*>(ptr_scales.data_ptr()),
+        reinterpret_cast<bfloat16_t*>(output.data_ptr()),
+        M,
+        N,
+        K);
+  }
+  return output;
+}
+
+at::Tensor fp8_block_dequant_xe2_impl(
+    const at::Tensor& ptr_B,
+    const at::Tensor& ptr_scales) {
+  TORCH_CHECK(
+      ptr_B.scalar_type() == at::kFloat8_e4m3fn,
+      "weight must be float8_e4m3fn");
+  TORCH_CHECK(
+      ptr_scales.scalar_type() == at::kFloat,
+      "weight scales must be float32");
+  TORCH_CHECK(ptr_B.dim() == 2, "weight must be 2D [N, K]");
+  TORCH_CHECK(
+      ptr_scales.dim() == 2,
+      "weight scales must be 2D [N / 128, K / 128]");
+  TORCH_CHECK(
+      ptr_B.device() == ptr_scales.device(),
+      "weight and scales must be on the same device");
+  TORCH_CHECK(
+      ptr_B.is_contiguous() && ptr_scales.is_contiguous(),
+      "weight and scales must be contiguous");
+
+  const int64_t N = ptr_B.size(0);
+  const int64_t K = ptr_B.size(1);
+  TORCH_CHECK(
+      N % 128 == 0 && K % 128 == 0,
+      "N and K must be divisible by 128");
+  TORCH_CHECK(
+      ptr_scales.size(0) == N / 128 &&
+          ptr_scales.size(1) == K / 128,
+      "weight scales must have shape [N / 128, K / 128]");
+
+  auto output = at::empty({N, K}, ptr_B.options().dtype(at::kHalf));
+  auto& queue = at::xpu::getCurrentXPUStream(ptr_B.device().index()).queue();
+  Fp8BlockDequantLauncher(
+      queue,
+      reinterpret_cast<const float_e4m3_t*>(ptr_B.data_ptr()),
+      reinterpret_cast<const float*>(ptr_scales.data_ptr()),
+      reinterpret_cast<half_t*>(output.data_ptr()),
+      N,
+      K);
+  return output;
 }
 }  // namespace MoE
