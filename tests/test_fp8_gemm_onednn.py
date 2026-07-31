@@ -230,6 +230,107 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
     torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "scale_dtype", [torch.float32, torch.bfloat16, torch.float16]
+)
+def test_fp8_gemm_w8a16_block_scale(out_dtype, scale_dtype):
+    torch.manual_seed(1234)
+    m, n, k, group_size = 17, 256, 512, 128
+
+    input = torch.randn(m, k, dtype=out_dtype, device="xpu") / 10.0
+    weight = torch.randn(n, k, dtype=out_dtype, device="xpu") / 10.0
+    weight_fp8 = weight.to(torch.float8_e4m3fn)
+    scales_nk = (
+        torch.rand(
+            n // group_size,
+            k // group_size,
+            dtype=torch.float32,
+            device="xpu",
+        )
+        / 100.0
+        + 0.001
+    )
+    # oneDNN runtime scales are a plain row-major array. A transposed view of
+    # the checkpoint's [N/group, K/group] scales has the right logical shape
+    # but the wrong physical order, so materialize [K/group, N/group].
+    scales_kn = scales_nk.to(scale_dtype).t().contiguous()
+
+    output = fp8_gemm_w8a16(
+        input,
+        weight_fp8.t(),
+        scales_kn,
+        None,
+        group_size,
+    )
+    expanded_scales = scales_nk.repeat_interleave(
+        group_size, 0
+    ).repeat_interleave(group_size, 1)
+    reference = input.float() @ (
+        weight_fp8.float() * expanded_scales.to(scale_dtype).float()
+    ).t()
+
+    output_float = output.float()
+    reference_float = reference.float()
+    relative_mae = (
+        (output_float - reference_float).abs().mean()
+        / reference_float.abs().mean().clamp_min(1e-8)
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        output_float.flatten(), reference_float.flatten(), dim=0
+    )
+    assert relative_mae < 1e-3
+    assert cosine > 0.99999
+
+
+def test_fp8_gemm_w8a16_block_scale_rejects_strided_scale():
+    m, n, k, group_size = 17, 256, 512, 128
+    input = torch.randn(m, k, dtype=torch.float16, device="xpu")
+    weight = torch.randn(n, k, dtype=torch.float16, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    scales_nk = torch.rand(
+        n // group_size,
+        k // group_size,
+        dtype=torch.float32,
+        device="xpu",
+    )
+    scales_kn = scales_nk.t()
+    assert not scales_kn.is_contiguous()
+
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        fp8_gemm_w8a16(
+            input,
+            weight.t(),
+            scales_kn,
+            None,
+            group_size,
+        )
+
+
+def test_fp8_gemm_w8a16_block_scale_rejects_bfloat16_activation():
+    m, n, k, group_size = 17, 256, 512, 128
+    input = torch.randn(m, k, dtype=torch.bfloat16, device="xpu")
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    scales_kn = torch.rand(
+        k // group_size,
+        n // group_size,
+        dtype=torch.float32,
+        device="xpu",
+    )
+
+    with pytest.raises(RuntimeError, match="require float16 activations"):
+        fp8_gemm_w8a16(
+            input,
+            weight.t(),
+            scales_kn,
+            None,
+            group_size,
+        )
+
+
 def _convert_to_mxfp8_with_hp_ref(t):
     # Convert a tensor to mxfp8, returning:
     #   t_hp : reconstructed bf16 version of t_lp

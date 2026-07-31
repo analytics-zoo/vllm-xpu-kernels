@@ -22,7 +22,8 @@ torch::Tensor fp8_gemm_w8a16(
     const torch::Tensor& A,
     const torch::Tensor& B,
     const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_);
+    const std::optional<torch::Tensor>& bias_,
+    int64_t group_size);
 
 torch::Tensor fp4_gemm(
     const torch::Tensor& A,
