@@ -105,8 +105,8 @@ torch::Tensor fp8_gemm_w8a16(
         "grouped FP8 weight scales must have shape "
         "[K / group_size, N / group_size]");
     TORCH_CHECK(
-        B_scale_->is_contiguous(),
-        "grouped FP8 weight scales must be contiguous");
+        B_scale_->is_non_overlapping_and_dense(),
+        "grouped FP8 weight scales must be non-overlapping and dense");
     TORCH_CHECK(
         B_scale_->device() == B.device(),
         "grouped FP8 weight scales and weight must be on the same device");

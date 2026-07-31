@@ -251,7 +251,12 @@ def test_fp8_gemm_w8a16_block_scale(out_dtype, scale_dtype):
         / 100.0
         + 0.001
     )
-    scales_kn = scales_nk.to(scale_dtype).t().contiguous()
+    # Keep the checkpoint's [N/group, K/group] scale storage and pass a
+    # zero-copy [K/group, N/group] transposed view to oneDNN. The oneDNN
+    # memory descriptor preserves tensor strides, so dense linear dispatch
+    # does not need a persistent transposed scale allocation.
+    scales_kn = scales_nk.to(scale_dtype).t()
+    assert not scales_kn.is_contiguous()
 
     output = fp8_gemm_w8a16(
         input,
