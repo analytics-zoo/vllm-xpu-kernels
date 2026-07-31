@@ -60,6 +60,14 @@ class w8a16_policy : public xe_gemm_policy_base {
   using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
 };
 
+class dense_w8a16_policy : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_256, _256, _16>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
 class w8a16_policy_m_8 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_8, _64, _32>;

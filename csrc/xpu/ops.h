@@ -22,7 +22,8 @@ torch::Tensor fp8_gemm_w8a16(
     const torch::Tensor& A,
     const torch::Tensor& B,
     const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_);
+    const std::optional<torch::Tensor>& bias_,
+    int64_t group_size);
 
 torch::Tensor fp4_gemm(
     const torch::Tensor& A,
@@ -66,6 +67,15 @@ torch::Tensor cutlass_grouped_gemm_interface(
     bool is_B_int4,
     bool is_B_mxfp4,
     bool is_B_fp8_block);
+
+torch::Tensor fp8_block_gemm_xe2_interface(
+    const torch::Tensor& ptr_A,
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales);
+
+torch::Tensor fp8_block_dequant_xe2_interface(
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales);
 #endif
 
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(

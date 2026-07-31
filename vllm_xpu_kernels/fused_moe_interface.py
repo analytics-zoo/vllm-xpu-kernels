@@ -81,6 +81,32 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         is_B_fp8_block=is_B_fp8_block)
 
 
+def fp8_block_gemm_xe2(input_A, input_B, scales):
+    """Dense Xe2 GEMM for FP16/BF16 activations and 128x128 block FP8 weights."""
+    return torch.ops._xpu_C.fp8_block_gemm_xe2(input_A, input_B, scales)
+
+
+def fp8_block_dequant_xe2(input_B, scales):
+    """Fuse FP8 conversion and 128x128 block scaling into one Xe2 kernel."""
+    return torch.ops._xpu_C.fp8_block_dequant_xe2(input_B, scales)
+
+
+def fp8_block_gemm_xe2_available(device_index):
+    return (
+        hasattr(torch.ops._xpu_C, "fp8_block_gemm_xe2")
+        and not _is_env_enabled("VLLM_XPU_FORCE_XE_DEFAULT_KERNEL")
+        and torch.ops._xpu_C.is_bmg(device_index)
+    )
+
+
+def fp8_block_dequant_xe2_available(device_index):
+    return (
+        hasattr(torch.ops._xpu_C, "fp8_block_dequant_xe2")
+        and not _is_env_enabled("VLLM_XPU_FORCE_XE_DEFAULT_KERNEL")
+        and torch.ops._xpu_C.is_bmg(device_index)
+    )
+
+
 def ceilDiv(a, b):
     return (a + b - 1) // b
 

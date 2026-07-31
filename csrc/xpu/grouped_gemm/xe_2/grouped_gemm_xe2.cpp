@@ -29,3 +29,16 @@ torch::Tensor cutlass_grouped_gemm_xe2(
       is_B_mxfp4,
       is_B_fp8_block);
 }
+
+torch::Tensor fp8_block_gemm_xe2(
+    const torch::Tensor& ptr_A,
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales) {
+  return MoE::fp8_block_gemm_xe2_impl(ptr_A, ptr_B, ptr_scales);
+}
+
+torch::Tensor fp8_block_dequant_xe2(
+    const torch::Tensor& ptr_B,
+    const torch::Tensor& ptr_scales) {
+  return MoE::fp8_block_dequant_xe2_impl(ptr_B, ptr_scales);
+}

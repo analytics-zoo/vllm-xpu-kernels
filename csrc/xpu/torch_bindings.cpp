@@ -18,7 +18,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 
   xpu_ops.def(
       "fp8_gemm_w8a16(Tensor A, Tensor B, Tensor? B_scale_, "
-      "Tensor? bias_) -> Tensor");
+      "Tensor? bias_, int group_size=0) -> Tensor");
   xpu_ops.impl("fp8_gemm_w8a16", torch::kXPU, &fp8_gemm_w8a16);
 
   xpu_ops.def(
@@ -52,6 +52,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+
+  #ifdef VLLM_XPU_ENABLE_XE2
+    xpu_ops.def(
+        "fp8_block_gemm_xe2(Tensor activation, Tensor weight, Tensor "
+        "weight_scales) -> Tensor");
+    xpu_ops.impl(
+        "fp8_block_gemm_xe2", torch::kXPU, &fp8_block_gemm_xe2_interface);
+    xpu_ops.def(
+        "fp8_block_dequant_xe2(Tensor weight, Tensor weight_scales) -> Tensor");
+    xpu_ops.impl(
+        "fp8_block_dequant_xe2",
+        torch::kXPU,
+        &fp8_block_dequant_xe2_interface);
+  #endif
 #endif
 
   xpu_ops.def(
