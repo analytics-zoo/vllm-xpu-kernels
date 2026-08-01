@@ -354,6 +354,7 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num];
+  scaleStoreType fp8_block_scale;
 
   clear(tCrC);
 
@@ -397,33 +398,36 @@ CUTE_DEVICE void xe_gemm_4bits(
     if (k_tile * tile_k % group_size == 0) {
       int group_idx = (k_tile * tile_k) / group_size;
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < thr_N; ++n) {
+      if constexpr (is_B_fp8_type) {
+        // A block-FP8 scale is shared by the complete 128-channel N tile.
+        // Load it once per thread and reuse it for every B fragment instead
+        // of issuing identical loads and retaining duplicate scale values.
+        fp8_block_scale = Scales
+            [(n_tile_start / group_size) * group_num + group_idx];
+      } else {
         CUTLASS_PRAGMA_UNROLL
-        for (int c = 0; c < channel_num; ++c) {
-          int real_idx = x_idx + c * (sg_local_range / channel_num);
-          int sg_local_n = n * sg_local_range + real_idx;
-          scaleStoreType scale;
-          if constexpr (std::is_same_v<TB, int4_t>) {
-            scale = Scales
-                [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                 group_idx];
-          } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
-            uint32_t scale_u32 =
-                Scales
-                    [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                     group_idx]
-                << 23;
-            scale = static_cast<scaleStoreType>(
-                reinterpret_cast<float&>(scale_u32));
-          } else if constexpr (is_B_fp8_type) {
-            scale = Scales
-                [((n_tile_start + n_sg_start + sg_local_n) / group_size) *
-                     group_num +
-                 group_idx];
-          }
+        for (int n = 0; n < thr_N; ++n) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < channel_num; ++c) {
+            int real_idx = x_idx + c * (sg_local_range / channel_num);
+            int sg_local_n = n * sg_local_range + real_idx;
+            scaleStoreType scale;
+            if constexpr (std::is_same_v<TB, int4_t>) {
+              scale = Scales
+                  [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+                   group_idx];
+            } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+              uint32_t scale_u32 =
+                  Scales
+                      [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+                       group_idx]
+                  << 23;
+              scale = static_cast<scaleStoreType>(
+                  reinterpret_cast<float&>(scale_u32));
+            }
 
-          scales[n * channel_num + c] = scale;
+            scales[n * channel_num + c] = scale;
+          }
         }
       }
 
@@ -463,10 +467,12 @@ CUTE_DEVICE void xe_gemm_4bits(
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
           if constexpr (std::is_same_v<TA, half_t>) {
-            tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
+            tCrB(cute::tuple(c, _), n, _)[i] *=
+                is_B_fp8_type ? fp8_block_scale : scales[n * channel_num + c];
           } else {
             tCrB(cute::tuple(c, _), n, _)[i] = apply_scale(
-                tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
+                tCrB(cute::tuple(c, _), n, _)[i],
+                is_B_fp8_type ? fp8_block_scale : scales[n * channel_num + c]);
           }
         }
       }
