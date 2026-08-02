@@ -399,9 +399,9 @@ CUTE_DEVICE void xe_gemm_4bits(
       int group_idx = (k_tile * tile_k) / group_size;
 
       if constexpr (is_B_fp8_type) {
-        // A block-FP8 scale is shared by the complete 128-channel N tile.
-        // Load it once per thread and reuse it for every B fragment instead
-        // of issuing identical loads and retaining duplicate scale values.
+        // A block-FP8 scale covers a 128-wide N block, which can span multiple
+        // workgroup N tiles. Load it once per thread and reuse it for every B
+        // fragment instead of issuing identical loads and retaining duplicates.
         fp8_block_scale = Scales
             [(n_tile_start / group_size) * group_num + group_idx];
       } else {
