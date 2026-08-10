@@ -23,8 +23,8 @@ def _is_env_enabled(env_name: str, default: str = "0") -> bool:
     return value in ("1", "ON", "TRUE", "YES", "Y")
 
 
-def _should_use_ref_fused_moe(is_mxfp8: bool, is_block_fp8: bool) -> bool:  
-    if is_mxfp8 or is_block_fp8:
+def _should_use_ref_fused_moe(is_mxfp8: bool) -> bool:
+    if is_mxfp8:
         return True
     return _is_env_enabled(REF_FUSED_MOE_ENV)
 
@@ -178,12 +178,12 @@ class XpuFusedMoe:
          is_mxfp8, 
          is_block_fp8) = _get_weights_dtype(w13, w13_scales)
 
-        # 4bits support [E, N, K]
-        # other types [E, K, N]
-        if not is_int4 and not is_mxfp4:
-            self.inter_size = w13.shape[-1] // 2
-        else:
+        # Quantized block/group formats use [E, N, K]; other types use
+        # [E, K, N].
+        if is_int4 or is_mxfp4 or is_block_fp8:
             self.inter_size = w13.shape[-2] // 2
+        else:
+            self.inter_size = w13.shape[-1] // 2
 
         # FIXME: move this to vllm
         if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
@@ -229,7 +229,7 @@ class XpuFusedMoe:
         self.gemm1_clamp_limit = gemm1_clamp_limit
         self.recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                                    is_block_fp8)
-        self._use_ref = _should_use_ref_fused_moe(is_mxfp8, is_block_fp8)
+        self._use_ref = _should_use_ref_fused_moe(is_mxfp8)
         if self.activation == "silu":
             self.act_func = torch.ops._C.silu_and_mul
         elif self.activation == "gelu":
@@ -483,12 +483,11 @@ def xpu_fused_moe(hidden_states,
         output.copy_(out)
         return output
 
-    # 4bits support [E, N, K]
-    # other types [E, K, N]
-    if not is_int4 and not is_mxfp4:
-        inter_size = list(w13.shape)[-1] // 2
-    else:
+    # Quantized block/group formats use [E, N, K]; other types use [E, K, N].
+    if is_int4 or is_mxfp4 or is_block_fp8:
         inter_size = list(w13.shape)[-2] // 2
+    else:
+        inter_size = list(w13.shape)[-1] // 2
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
