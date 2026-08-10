@@ -584,20 +584,23 @@ def ref_gdn_attention_spec(
     for n in range(num_spec_decodes):
         start = int(spec_query_start_loc[n].item())
         end = int(spec_query_start_loc[n + 1].item())
-        assert end - start == K, (end - start, K)
+        seq_len = end - start
+        assert 0 <= seq_len <= K, (seq_len, K)
         globals_ = spec_token_indx[start:end].to(torch.long)
 
         naccepted = int(num_accepted_tokens[n].item())
         init_col = max(naccepted - 1, 0)
         init_slot = int(spec_state_indices_tensor[n, init_col].item())
-        final_conv_slot = int(spec_state_indices_tensor[n, K - 1].item())
-
         # ---- conv1d on the K gathered tokens (with Width-1 history) ----
         conv_state_batch = conv_state[init_slot].clone()
-        qkv_batch = qkv[globals_]  # [K, qkv_elems]
+        qkv_batch = qkv[globals_]  # [seq_len, qkv_elems]
         qkv_conv_input = torch.cat([conv_state_batch, qkv_batch], dim=0)
-        # Final conv state goes ONLY to the last cache slot.
-        conv_state[final_conv_slot] = qkv_conv_input[-(width - 1):]
+        # Checkpoint the rolling state at each actual speculative token. The
+        # cache row has K rollback slots but a compact ragged row uses only its
+        # leading seq_len slots.
+        for t in range(seq_len):
+            slot = int(spec_state_indices_tensor[n, t].item())
+            conv_state[slot] = qkv_conv_input[t + 1:t + width]
 
         qkv_conv_in = qkv_conv_input.transpose(0, 1).unsqueeze(0).to(
             torch.float32)
@@ -609,12 +612,12 @@ def ref_gdn_attention_spec(
         qkv_conv_out = (qkv_conv_out if activation is None else
                         F.silu(qkv_conv_out)).to(dtype=dtype)
         qkv_conv_out = qkv_conv_out.transpose(-2, -1).reshape(
-            K, qkv_elems_size)
+            seq_len, qkv_elems_size)
 
         q_out, k_out, v_out = torch.split(qkv_conv_out, split_qkv, dim=-1)
-        q_out = q_out.reshape(K, num_k_heads // tp_size, head_k_dim)
-        k_out = k_out.reshape(K, num_k_heads // tp_size, head_k_dim)
-        v_out = v_out.reshape(K, num_v_heads // tp_size, head_v_dim)
+        q_out = q_out.reshape(seq_len, num_k_heads // tp_size, head_k_dim)
+        k_out = k_out.reshape(seq_len, num_k_heads // tp_size, head_k_dim)
+        v_out = v_out.reshape(seq_len, num_v_heads // tp_size, head_v_dim)
 
         # ---- SSM recurrence (same as non-spec, just per-step writeback) ----
         ssm_state_batch = ssm_state[init_slot].to(torch.float32).clone()
@@ -634,7 +637,7 @@ def ref_gdn_attention_spec(
             q_all = q_all.repeat_interleave(rep, dim=1)
             k_all = k_all.repeat_interleave(rep, dim=1)
 
-        for t in range(K):
+        for t in range(seq_len):
             g_t = g_batch[t]
             beta_t = beta_batch[t]
             q_t = q_all[t]
@@ -667,11 +670,12 @@ def ref_gdn_attention_spec(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=format_tc)
 @pytest.mark.parametrize("ssm_state_is_fp32", [False, True])
+@pytest.mark.parametrize("ragged", [False, True])
 @torch.inference_mode()
 def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
                            head_k_dim, num_v_heads, head_v_dim, width,
                            tp_size, has_bias, activation, reorder_input,
-                           dtype, ssm_state_is_fp32):
+                           dtype, ssm_state_is_fp32, ragged):
     """Pure spec-decode batch: num_prefills == num_decodes == 0,
     num_spec_decodes sequences each contributing num_spec_tokens tokens.
     Token positions are shuffled in the global buffer via spec_token_indx
@@ -687,7 +691,12 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
 
     assert head_k_dim == head_v_dim
     K = num_spec_tokens
-    num_actual_tokens = num_spec_decodes * K
+    spec_lens = [K] * num_spec_decodes
+    if ragged:
+        # Model a graph-padded trailing request: cache rows retain K rollback
+        # slots, while the compact speculative-token buffer has one fewer row.
+        spec_lens[-1] -= 1
+    num_actual_tokens = sum(spec_lens)
     cache_batch_size = 200
 
     mixed_qkvz_size = num_k_heads // tp_size * (
@@ -716,6 +725,7 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
                             head_k_dim,
                             dtype=ssm_state_dtype,
                             device=device)
+    initial_ssm_state = ssm_state.clone()
     ref_ssm_state = ssm_state.clone()
     conv_weights = torch.randn(mixed_qkv_size,
                                width,
@@ -743,8 +753,10 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
     # Shuffle global token positions across the K-tokens-per-seq layout.
     perm = torch.randperm(num_actual_tokens, device=device).to(torch.int32)
     spec_token_indx = perm.contiguous()
-    spec_query_start_loc = (torch.arange(
-        num_spec_decodes + 1, dtype=torch.int32, device=device) * K)
+    spec_query_start_loc = torch.tensor([0] + spec_lens,
+                                        dtype=torch.int32,
+                                        device=device).cumsum(
+                                            dim=0, dtype=torch.int32)
 
     core_attn_out = torch.zeros(num_actual_tokens,
                                 num_v_heads // tp_size,
@@ -822,20 +834,25 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
                                rtol=rtol,
                                equal_nan=True)
 
-    # Final conv-state slot per seq (col K-1) must match the reference.
+    # Actual rows are updated; unused rollback columns in a ragged final row
+    # remain untouched.
     for n in range(num_spec_decodes):
-        final_slot = int(spec_state_indices_tensor[n, K - 1].item())
-        torch.testing.assert_close(conv_state[final_slot],
-                                   ref_conv_state[final_slot],
-                                   atol=atol,
-                                   rtol=rtol)
-        # All K ssm-state slots are written per-step.
-        for t in range(K):
+        for t in range(spec_lens[n]):
             slot = int(spec_state_indices_tensor[n, t].item())
+            torch.testing.assert_close(conv_state[slot],
+                                       ref_conv_state[slot],
+                                       atol=atol,
+                                       rtol=rtol)
             torch.testing.assert_close(ssm_state[slot],
                                        ref_ssm_state[slot],
                                        atol=atol,
                                        rtol=rtol)
+        for t in range(spec_lens[n], K):
+            slot = int(spec_state_indices_tensor[n, t].item())
+            torch.testing.assert_close(ssm_state[slot],
+                                       initial_ssm_state[slot],
+                                       atol=0,
+                                       rtol=0)
 
 
 # GQA ratio num_v_heads/num_k_heads == 3 regression. The SLM-tiled prefill
