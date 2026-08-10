@@ -314,6 +314,7 @@ def flash_attn_varlen_func(
     num_splits_kv: Optional[int] = None,
     is_mix_batch: bool = True,
     host_kv_lens: Optional[torch.Tensor] = None,
+    per_seq_causal: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -444,6 +445,7 @@ def flash_attn_varlen_func(
                 is_mix_batch,
                 splits_per_seq_dev,
                 work_list_dev,
+                per_seq_causal,
             )
         except RuntimeError as e:
             if "not compiled" not in str(e):
@@ -567,5 +569,4 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
-
 
