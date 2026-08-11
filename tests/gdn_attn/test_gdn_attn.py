@@ -1040,6 +1040,10 @@ def test_chunk_prepare_vhead_oob_guard(dtype):
         num_actual_tokens=num_actual_tokens, tp_size=tp_size,
         reorder_input=False)
 
+    assert torch.isfinite(z).all()
+    assert torch.isfinite(core_attn_out).all()
+    assert torch.isfinite(conv_state).all()
+    assert torch.isfinite(ssm_state).all()
     atol = rtol = 5e-2
     torch.testing.assert_close(z, ref_z, atol=atol, rtol=rtol)
     torch.testing.assert_close(core_attn_out, ref_core_attn_out, atol=atol,
@@ -1146,6 +1150,10 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
         num_actual_tokens=num_actual_tokens, tp_size=tp_size,
         reorder_input=False)
 
+    assert torch.isfinite(z).all()
+    assert torch.isfinite(core_attn_out).all()
+    assert torch.isfinite(conv_state).all()
+    assert torch.isfinite(ssm_state).all()
     atol = rtol = 5e-2
     torch.testing.assert_close(z, ref_z, atol=atol, rtol=rtol)
     torch.testing.assert_close(core_attn_out, ref_core_attn_out, atol=atol,
