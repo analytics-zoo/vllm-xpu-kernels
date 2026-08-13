@@ -83,6 +83,65 @@ def test_rms_norm(
                 (out, x, layer.weight.data, layer.variance_epsilon))
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size"),
+    [(1, 768), (83, 768), (1, 769), (83, 769), (1, 5120), (83, 5120),
+     (32, 128)],
+)
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_rms_norm_float_weight(
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    device: str,
+    strided_input: bool,
+) -> None:
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+    scale = 1 / (2 * hidden_size)
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x = torch.randn(num_tokens, last_dim, dtype=dtype)
+    x = x[..., :hidden_size]
+    x *= scale
+    weight = torch.empty(hidden_size, dtype=torch.float32)
+    weight.normal_(mean=1.0, std=0.1)
+    epsilon = 1e-6
+
+    x_float = x.float()
+    residual = None
+    if add_residual:
+        residual = torch.randn_like(x) * scale
+        x_float = x_float + residual.float()
+    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+    ref_out = (x_float * torch.rsqrt(variance + epsilon) * weight).to(dtype)
+
+    if residual is None:
+        out = torch.empty_like(x)
+        torch.ops._C.rms_norm(out, x, weight, epsilon)
+        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+        opcheck(torch.ops._C.rms_norm, (out, x, weight, epsilon))
+    else:
+        ref_residual = x_float.to(dtype)
+        out = x.clone()
+        residual_out = residual.clone()
+        torch.ops._C.fused_add_rms_norm(
+            out, residual_out, weight, epsilon)
+        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            residual_out, ref_residual, atol=0.0, rtol=0.0)
+        opcheck(
+            torch.ops._C.fused_add_rms_norm,
+            (x.clone(), residual.clone(), weight, epsilon),
+        )
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("num_q_heads", NUM_Q_HEADS)
