@@ -385,6 +385,152 @@ def test_varlen_with_paged_kv(
     torch.xpu.empty_cache()
 
 
+@torch.inference_mode()
+def test_varlen_per_seq_causal_all_prefill_local_window():
+    """One FA2 prefill launch may mix causal and bidirectional sequences."""
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(20260807)
+
+    query_lens = [3, 4, 2]
+    kv_lens = [9, 10, 8]
+    per_seq_causal = [True, False, True]
+    num_query_heads, num_kv_heads, head_size = 8, 2, 64
+    block_size, num_blocks = 16, 32
+    window_size = (4, 2)
+    dtype = torch.bfloat16
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size,
+                        dtype=dtype)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size,
+                            dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks = max((length + block_size - 1) // block_size
+                         for length in kv_lens)
+    block_tables = torch.randint(0, num_blocks,
+                                 (len(query_lens), max_num_blocks),
+                                 dtype=torch.int32)
+    causal_mask = torch.tensor(per_seq_causal, dtype=torch.bool)
+
+    output = flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        max(query_lens),
+        cu_query_lens,
+        max(kv_lens),
+        seqused_k=seqused_k,
+        softmax_scale=head_size**-0.5,
+        causal=True,
+        block_table=block_tables,
+        window_size=window_size,
+        per_seq_causal=causal_mask,
+    )
+
+    expected = []
+    offset = 0
+    for index, (query_len, kv_len, is_causal) in enumerate(
+            zip(query_lens, kv_lens, per_seq_causal)):
+        # The port preserves a causal layer's one-sided window for causal
+        # sequences, but uses a symmetric local window for a bidirectional
+        # sequence in that same launch.
+        window_size_right = window_size[1] if is_causal else window_size[0]
+        expected.append(
+            ref_paged_attn(
+                query=query[offset:offset + query_len].contiguous(),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                query_lens=[query_len],
+                kv_lens=[kv_len],
+                block_tables=block_tables[index:index + 1],
+                scale=head_size**-0.5,
+                casual=is_causal,
+                is_paged=True,
+                window_size_left=window_size[0],
+                window_size_right=window_size_right,
+                dtype=dtype))
+        offset += query_len
+
+    torch.testing.assert_close(output,
+                               torch.cat(expected),
+                               atol=1.5e-2,
+                               rtol=1.5e-2)
+    torch.xpu.empty_cache()
+
+
+@torch.inference_mode()
+def test_varlen_per_seq_causal_all_prefill_xpu_graph_replay():
+    """The graph-safe prefill launch must replay a mixed causal batch."""
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(20260807)
+
+    query_lens = [2, 3]
+    kv_lens = [7, 8]
+    query = torch.randn(sum(query_lens), 8, 64, dtype=torch.bfloat16)
+    key_cache = torch.randn(16, 16, 2, 64, dtype=torch.bfloat16)
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+    block_tables = torch.randint(0, 16, (2, 1), dtype=torch.int32)
+    causal_mask = torch.tensor([True, False], dtype=torch.bool)
+
+    kwargs = dict(seqused_k=seqused_k,
+                  softmax_scale=64**-0.5,
+                  causal=True,
+                  block_table=block_tables,
+                  window_size=(4, 2),
+                  per_seq_causal=causal_mask)
+    eager = flash_attn_varlen_func(query, key_cache, value_cache,
+                                   max(query_lens), cu_query_lens,
+                                   max(kv_lens), **kwargs)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        captured = flash_attn_varlen_func(query, key_cache, value_cache,
+                                          max(query_lens), cu_query_lens,
+                                          max(kv_lens), **kwargs)
+    graph.replay()
+    torch.xpu.synchronize()
+    torch.testing.assert_close(captured, eager, atol=1.5e-2, rtol=1.5e-2)
+    torch.xpu.empty_cache()
+
+
+@torch.inference_mode()
+def test_paged_decode_xpu_graph_replay():
+    """The graph-safe paged-decode launch must replay with static inputs."""
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(20260807)
+
+    query = torch.randn(2, 8, 64, dtype=torch.bfloat16)
+    key_cache = torch.randn(16, 16, 2, 64, dtype=torch.bfloat16)
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0, 1, 2], dtype=torch.int32)
+    seqused_k = torch.tensor([7, 8], dtype=torch.int32)
+    block_tables = torch.randint(0, 16, (2, 1), dtype=torch.int32)
+    kwargs = dict(seqused_k=seqused_k,
+                  softmax_scale=64**-0.5,
+                  causal=True,
+                  block_table=block_tables,
+                  window_size=(-1, -1))
+    eager = flash_attn_varlen_func(query, key_cache, value_cache, 1,
+                                   cu_query_lens, 8, **kwargs)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        captured = flash_attn_varlen_func(query, key_cache, value_cache, 1,
+                                          cu_query_lens, 8, **kwargs)
+    graph.replay()
+    torch.xpu.synchronize()
+    torch.testing.assert_close(captured, eager, atol=1.5e-2, rtol=1.5e-2)
+    torch.xpu.empty_cache()
+
+
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
