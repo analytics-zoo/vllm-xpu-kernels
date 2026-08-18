@@ -221,7 +221,8 @@ def test_xe_grouped_gemm_fp8(m, n, k, e, topk, dtype, fp8_dtype, has_bias):
 
 
 @pytest.mark.parametrize("n,k", [(1024, 2048), (2048, 512)])
-def test_xe_grouped_gemm_fp8_block_qwen_shape(n, k):
+@pytest.mark.parametrize("weight_layout", ["nk", "kn"])
+def test_xe_grouped_gemm_fp8_block_qwen_shape(n, k, weight_layout):
     seed_everything(7)
     rows = [130, 0, 67, 9]
     num_experts = len(rows)
@@ -236,12 +237,17 @@ def test_xe_grouped_gemm_fp8_block_qwen_shape(n, k):
     input_b = (source / expanded_scales).clamp(-448, 448).to(
         torch.float8_e4m3fn
     )
+    kernel_input_b = (
+        input_b.transpose(1, 2).contiguous()
+        if weight_layout == "kn"
+        else input_b
+    )
     rows_per_expert = torch.tensor(rows, dtype=torch.int32, device=DEVICE)
     output = torch.empty(total_m, n, dtype=torch.float16, device=DEVICE)
 
     cutlass_grouped_gemm_xe2(
         input_a,
-        input_b,
+        kernel_input_b,
         scales,
         None,
         output,

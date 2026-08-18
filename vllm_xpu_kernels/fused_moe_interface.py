@@ -17,6 +17,7 @@ from .moe_utils import quant_act_xpu, ref_fused_moe
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
+FP8_BLOCK_SIZE = 128
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
     value = os.environ.get(env_name, default).strip().upper()
@@ -58,6 +59,14 @@ def _get_weights_dtype(weight, scales):
     is_fp8 = is_fp8 and not is_mxfp8 and not is_block_fp8
 
     return is_fp8, is_int4, is_mxfp4, is_mxfp8, is_block_fp8
+
+
+def _get_inter_size(w13, w13_scales, is_int4, is_mxfp4, is_block_fp8):
+    if is_block_fp8:
+        return w13_scales.shape[-2] * FP8_BLOCK_SIZE // 2
+    if is_int4 or is_mxfp4:
+        return w13.shape[-2] // 2
+    return w13.shape[-1] // 2
 
 
 def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
@@ -178,12 +187,9 @@ class XpuFusedMoe:
          is_mxfp8, 
          is_block_fp8) = _get_weights_dtype(w13, w13_scales)
 
-        # Quantized block/group formats use [E, N, K]; other types use
-        # [E, K, N].
-        if is_int4 or is_mxfp4 or is_block_fp8:
-            self.inter_size = w13.shape[-2] // 2
-        else:
-            self.inter_size = w13.shape[-1] // 2
+        self.inter_size = _get_inter_size(
+            w13, w13_scales, is_int4, is_mxfp4, is_block_fp8
+        )
 
         # FIXME: move this to vllm
         if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
@@ -483,11 +489,9 @@ def xpu_fused_moe(hidden_states,
         output.copy_(out)
         return output
 
-    # Quantized block/group formats use [E, N, K]; other types use [E, K, N].
-    if is_int4 or is_mxfp4 or is_block_fp8:
-        inter_size = list(w13.shape)[-2] // 2
-    else:
-        inter_size = list(w13.shape)[-1] // 2
+    inter_size = _get_inter_size(
+        w13, w13_scales, is_int4, is_mxfp4, is_block_fp8
+    )
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
