@@ -790,6 +790,12 @@ void rms_norm(
     torch::Tensor& weight,
     double epsilon) {
   const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(
+      out.device() == input.device(),
+      "out and input must be on the same device");
+  TORCH_CHECK(
+      weight.device() == input.device(),
+      "weight and input must be on the same device");
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {
     input = input.contiguous();
@@ -821,6 +827,15 @@ void fused_add_rms_norm(
     torch::Tensor& weight,
     double epsilon) {
   const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(
+      residual.device() == input.device(),
+      "residual and input must be on the same device");
+  TORCH_CHECK(
+      weight.device() == input.device(),
+      "weight and input must be on the same device");
+  TORCH_CHECK(
+      input.stride(-1) == 1, "input must be contiguous in the last dimension");
+  TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
   TORCH_CHECK(residual.scalar_type() == input.scalar_type());
   TORCH_CHECK(weight.is_contiguous());
   if (weight.scalar_type() == input.scalar_type()) {

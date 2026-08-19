@@ -123,7 +123,7 @@ def test_rms_norm_float_weight(
     ref_out = (x_float * torch.rsqrt(variance + epsilon) * weight).to(dtype)
 
     if residual is None:
-        out = torch.empty_like(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         torch.ops._C.rms_norm(out, x, weight, epsilon)
         torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
         opcheck(torch.ops._C.rms_norm, (out, x, weight, epsilon))
@@ -140,6 +140,82 @@ def test_rms_norm_float_weight(
             torch.ops._C.fused_add_rms_norm,
             (x.clone(), residual.clone(), weight, epsilon),
         )
+
+
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("tensor_name", ["out", "weight"])
+def test_rms_norm_rejects_mismatched_devices(
+    device: str,
+    tensor_name: str,
+) -> None:
+    x = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
+    tensors = {
+        "out": torch.empty_like(x),
+        "weight": torch.ones(8, dtype=torch.float32, device=device),
+    }
+    tensors[tensor_name] = tensors[tensor_name].cpu()
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{tensor_name} and input must be on the same device",
+    ):
+        torch.ops._C.rms_norm(
+            tensors["out"],
+            x,
+            tensors["weight"],
+            1e-6,
+        )
+
+
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("tensor_name", ["residual", "weight"])
+def test_fused_add_rms_norm_rejects_mismatched_devices(
+    device: str,
+    tensor_name: str,
+) -> None:
+    x = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
+    tensors = {
+        "residual": torch.randn_like(x),
+        "weight": torch.ones(8, dtype=torch.float32, device=device),
+    }
+    tensors[tensor_name] = tensors[tensor_name].cpu()
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{tensor_name} and input must be on the same device",
+    ):
+        torch.ops._C.fused_add_rms_norm(
+            x,
+            tensors["residual"],
+            tensors["weight"],
+            1e-6,
+        )
+
+
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize(
+    ("unsupported_tensor", "error"),
+    [
+        ("input", "input must be contiguous in the last dimension"),
+        ("residual", "residual must be contiguous"),
+    ],
+)
+def test_fused_add_rms_norm_rejects_unsupported_layout(
+    device: str,
+    unsupported_tensor: str,
+    error: str,
+) -> None:
+    x = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(x)
+    if unsupported_tensor == "input":
+        x = torch.randn(2, 16, dtype=torch.bfloat16, device=device)[:, ::2]
+    else:
+        residual = torch.randn(
+            2, 16, dtype=torch.bfloat16, device=device)[:, :8]
+    weight = torch.ones(8, dtype=torch.float32, device=device)
+
+    with pytest.raises(RuntimeError, match=error):
+        torch.ops._C.fused_add_rms_norm(x, residual, weight, 1e-6)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
