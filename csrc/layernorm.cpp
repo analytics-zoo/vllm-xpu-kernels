@@ -796,6 +796,8 @@ void rms_norm(
   TORCH_CHECK(
       weight.device() == input.device(),
       "weight and input must be on the same device");
+  TORCH_CHECK(
+      out.sizes() == input.sizes(), "out and input must have the same shape");
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {
     input = input.contiguous();
@@ -836,6 +838,9 @@ void fused_add_rms_norm(
   TORCH_CHECK(
       weight.device() == input.device(),
       "weight and input must be on the same device");
+  TORCH_CHECK(
+      residual.sizes() == input.sizes(),
+      "residual and input must have the same shape");
   TORCH_CHECK(
       input.stride(-1) == 1, "input must be contiguous in the last dimension");
   TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");

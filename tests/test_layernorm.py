@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+import vllm_xpu_kernels._C  # noqa: F401
 from tests.ops.layernorm_op import RMSNorm
 from tests.utils import opcheck
 
@@ -101,8 +102,6 @@ def test_rms_norm_float_weight(
     device: str,
     strided_input: bool,
 ) -> None:
-    import vllm_xpu_kernels._C  # noqa: F401
-
     torch.set_default_device("xpu")
     torch.xpu.set_device(device)
     scale = 1 / (2 * hidden_size)
@@ -199,6 +198,34 @@ def test_fused_add_rms_norm_rejects_mismatched_devices(
             x,
             tensors["residual"],
             tensors["weight"],
+            1e-6,
+        )
+
+
+@pytest.mark.parametrize("device", XPU_DEVICES)
+def test_rms_norm_rejects_mismatched_shapes(device: str) -> None:
+    x = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
+    weight = torch.ones(8, dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        RuntimeError,
+        match="out and input must have the same shape",
+    ):
+        torch.ops._C.rms_norm(
+            torch.empty(1, 8, dtype=x.dtype, device=device),
+            x,
+            weight,
+            1e-6,
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="residual and input must have the same shape",
+    ):
+        torch.ops._C.fused_add_rms_norm(
+            x,
+            torch.empty(1, 8, dtype=x.dtype, device=device),
+            weight,
             1e-6,
         )
 
