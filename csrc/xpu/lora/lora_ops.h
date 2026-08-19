@@ -144,7 +144,8 @@ void lora_expand(
 //------------------------------------------------------------------------------
 // Multi-slice LoRA linear projection using a temporary active-rank buffer.
 //
-//   output += (inputs @ lora_a_weights.T) @ lora_b_weights.T
+//   delta_s = scaling * (inputs @ lora_a_weights_s.T) @ lora_b_weights_s.T
+//   output_s = add_inputs ? output_s + delta_s : delta_s
 //
 // The stored weights may be padded to a rank larger than active_rank.
 //------------------------------------------------------------------------------

@@ -43,11 +43,15 @@ namespace vllm::lora {
 // Maximum number of slices supported (QKV typically has 3).
 // Weight pointers are stored in a fixed-size array passed to the kernel.
 constexpr int kMaxSlices = 8;
+// Empirical BMG scheduling thresholds. Problem sizes are output elements.
 constexpr uint32_t kSmallProblemThreshold = 8192;
 constexpr uint32_t kMediumProblemThreshold = 65536;
 constexpr uint32_t kLargeProblemThreshold = 1048576;
+// Bound large-problem launch overhead while retaining enough XPU occupancy.
 constexpr uint32_t kMaxWorkgroups = 8192;
 constexpr uint32_t kLargeProblemElementsPerThread = 16;
+// Output columns at which balanced rank-128 three-slice projections run
+// faster as separate slice launches than as one combined launch.
 constexpr uint32_t kBalancedThreeSliceFallbackOutput = 8192;
 
 // ============================================================================
