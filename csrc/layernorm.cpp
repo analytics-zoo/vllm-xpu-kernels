@@ -802,6 +802,9 @@ void rms_norm(
   }
   TORCH_CHECK(input.stride(-1) == 1);
   TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(
+      weight.numel() == input.size(-1),
+      "weight.numel() must match input.size(-1)");
   TORCH_CHECK(out.scalar_type() == input.scalar_type());
   if (weight.scalar_type() == input.scalar_type()) {
     VLLM_DISPATCH_FLOATING_TYPES(
@@ -838,6 +841,9 @@ void fused_add_rms_norm(
   TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
   TORCH_CHECK(residual.scalar_type() == input.scalar_type());
   TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(
+      weight.numel() == input.size(-1),
+      "weight.numel() must match input.size(-1)");
   if (weight.scalar_type() == input.scalar_type()) {
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "call_fused_add_rms_norm_kernel", [&] {

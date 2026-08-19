@@ -129,16 +129,27 @@ def test_rms_norm_float_weight(
         opcheck(torch.ops._C.rms_norm, (out, x, weight, epsilon))
     else:
         ref_residual = x_float.to(dtype)
-        out = x.clone()
+        out = torch.empty_strided(
+            x.shape,
+            x.stride(),
+            dtype=x.dtype,
+            device=x.device,
+        ).copy_(x)
         residual_out = residual.clone()
         torch.ops._C.fused_add_rms_norm(
             out, residual_out, weight, epsilon)
         torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             residual_out, ref_residual, atol=0.0, rtol=0.0)
+        opcheck_out = torch.empty_strided(
+            x.shape,
+            x.stride(),
+            dtype=x.dtype,
+            device=x.device,
+        ).copy_(x)
         opcheck(
             torch.ops._C.fused_add_rms_norm,
-            (x.clone(), residual.clone(), weight, epsilon),
+            (opcheck_out, residual.clone(), weight, epsilon),
         )
 
 
@@ -190,6 +201,35 @@ def test_fused_add_rms_norm_rejects_mismatched_devices(
             tensors["weight"],
             1e-6,
         )
+
+
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("fused", [False, True])
+def test_rms_norm_rejects_wrong_weight_size(
+    device: str,
+    fused: bool,
+) -> None:
+    x = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
+    weight = torch.ones(7, dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"weight.numel\(\) must match input.size\(-1\)",
+    ):
+        if fused:
+            torch.ops._C.fused_add_rms_norm(
+                x,
+                torch.randn_like(x),
+                weight,
+                1e-6,
+            )
+        else:
+            torch.ops._C.rms_norm(
+                torch.empty_like(x),
+                x,
+                weight,
+                1e-6,
+            )
 
 
 @pytest.mark.parametrize("device", XPU_DEVICES)
