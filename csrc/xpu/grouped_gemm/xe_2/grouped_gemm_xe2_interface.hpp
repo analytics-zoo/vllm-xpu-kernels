@@ -212,7 +212,12 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(
         block_weight_is_nk || block_weight_is_kn,
         "block FP8 ptr_B must be [num_experts, N, K] or "
-        "[num_experts, K, N]");
+        "[num_experts, K, N] (N=",
+        N,
+        ", K=",
+        K,
+        "), got ",
+        ptr_B.sizes());
     B_K = K;
     B_N = N;
   }
@@ -224,8 +229,12 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
 
   TORCH_CHECK(B_E == num_experts, "ptr_B.size(0) must match num_experts");
   TORCH_CHECK(A_total_M == D_total_M, "ptr_A.size(0) must match ptr_D.size(0)");
-  TORCH_CHECK(A_K == B_K && B_K == K, "ptr_A.size(1) must match ptr_B.size(1)");
-  TORCH_CHECK(B_N == D_N && D_N == N, "ptr_B.size(2) must match ptr_D.size(1)");
+  TORCH_CHECK(
+      A_K == B_K && B_K == K,
+      "ptr_A K dimension must match ptr_B logical K dimension and K");
+  TORCH_CHECK(
+      B_N == D_N && D_N == N,
+      "ptr_B logical N dimension must match ptr_D N dimension and N");
   if (ptr_bias.has_value()) {
     TORCH_CHECK(
         ptr_bias->size(0) == num_experts,

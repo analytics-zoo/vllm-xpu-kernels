@@ -36,13 +36,14 @@ MINI_PYTEST_PARAMS = {
 
 @pytest.mark.parametrize("weight_layout", ["nk", "kn"])
 def test_fused_moe_block_fp8_inter_size_uses_scales(weight_layout):
-    weight_nk = torch.empty(2, 512, 256, dtype=torch.float8_e4m3fn)
+    weight_nk = torch.empty(
+        2, 512, 256, dtype=torch.float8_e4m3fn, device=DEVICE)
     weight = (
         weight_nk.transpose(-1, -2).contiguous()
         if weight_layout == "kn"
         else weight_nk
     )
-    scales = torch.empty(2, 4, 2, dtype=torch.float32)
+    scales = torch.empty(2, 4, 2, dtype=torch.float32, device=DEVICE)
 
     fused_moe = XpuFusedMoe(
         w13=weight,
