@@ -164,7 +164,7 @@ class LoRAKernelMeta:
         # This ensures the kernel grid dimension matches the captured graph.
         if self.captured_lora_counts and num_active_loras > 0:
             idx = bisect.bisect_left(
-                self.captured_lora_counts,num_active_loras
+                self.captured_lora_counts, num_active_loras
             )
             if idx < len(self.captured_lora_counts):
                 num_active_loras = self.captured_lora_counts[idx]
