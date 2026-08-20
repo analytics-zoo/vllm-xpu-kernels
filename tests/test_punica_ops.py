@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Tests for multi-slice lora_shrink / lora_expand XPU kernels.
+
+These ops process ALL slices in a single kernel launch, unlike the
+per-slice bgmv_shrink / bgmv_expand / bgmv_expand_slice ops tested
+in test_lora_ops.py.
+"""
 from threading import Lock
 
 import pytest
 import torch
 
 from tests.lora import torch_ops, xpu_ops
+from tests.lora.lora_kernel_metadata import LoRAKernelMeta
 from tests.lora.utils import (PunicaTensors, assert_close,
                               generate_data_for_nslices)
 from tests.utils import format_tc, seed_everything
@@ -22,24 +30,13 @@ MINI_PYTEST_PARAMS = {
         "seed": [0],
         "op_type": ["shrink", "expand"],
     },
-    "test_kernels_hidden_size": {
+    "test_hidden_size": {
         "batches": [4],
         "num_loras": [4],
         "rank": [32],
         "hidden_size": [128],
         "nslices": [1],
         "dtype": [torch.float16],
-        "device": ["xpu:0"],
-        "seed": [0],
-        "op_type": ["shrink", "expand"],
-    },
-    "test_kernels_mixed_precision": {
-        "batches": [1],
-        "num_loras": [1],
-        "rank": [1],
-        "hidden_size": [128],
-        "nslices": [1],
-        "weight_dtype": [torch.float16],
         "device": ["xpu:0"],
         "seed": [0],
         "op_type": ["shrink", "expand"],
@@ -51,20 +48,19 @@ MINI_PYTEST_PARAMS = {
 def reset_device(reset_default_device):
     pass
 
-
 # Utility shrink and expand operations used as reference implementations.
 def sgmv_shrink_for_nslices(
-    nslices: int,
-    inputs_tensor: torch.Tensor,
-    lora_weights_lst: list[torch.Tensor],
-    out_tensor: torch.Tensor,
-    b_seq_start_loc: torch.Tensor,
-    seq_len_tensor: torch.Tensor,
-    prompt_lora_mapping: torch.Tensor,
-    batches: int,
-    max_seq_length: int,
-    num_tokens: int,
-    scaling: float,
+        nslices: int,
+        inputs_tensor: torch.Tensor,
+        lora_weights_lst: list[torch.Tensor],
+        out_tensor: torch.Tensor,
+        b_seq_start_loc: torch.Tensor,
+        seq_len_tensor: torch.Tensor,
+        prompt_lora_mapping: torch.Tensor,
+        batches: int,
+        max_seq_length: int,
+        num_tokens: int,
+        scaling: float,
 ):
     """
     Wrapper around torch_ops.sgmv_shrink that handles any nslices.
@@ -85,18 +81,18 @@ def sgmv_shrink_for_nslices(
 
 
 def sgmv_expand_for_nslices(
-    nslices: int,
-    hidden_size: int,
-    inputs_tensor: torch.Tensor,
-    lora_weights_lst: list[torch.Tensor],
-    out_tensor: torch.Tensor,
-    b_seq_start_loc: torch.Tensor,
-    seq_len_tensor: torch.Tensor,
-    prompt_lora_mapping: torch.Tensor,
-    batches: int,
-    max_seq_length: int,
-    num_tokens: int,
-    add_inputs: bool,
+        nslices: int,
+        hidden_size: int,
+        inputs_tensor: torch.Tensor,
+        lora_weights_lst: list[torch.Tensor],
+        out_tensor: torch.Tensor,
+        b_seq_start_loc: torch.Tensor,
+        seq_len_tensor: torch.Tensor,
+        prompt_lora_mapping: torch.Tensor,
+        batches: int,
+        max_seq_length: int,
+        num_tokens: int,
+        add_inputs: bool,
 ) -> None:
     """
     Wrapper around torch_ops.sgmv_expand that handles any nslices.
@@ -139,110 +135,6 @@ def sgmv_expand_for_nslices(
 _dict_lock = Lock()
 
 
-def test_lora_shrink_uses_active_rank_with_padded_weights():
-    batch_size = 4
-    hidden_size = 128
-    active_rank = 64
-    stored_rank = 128
-    num_loras = 2
-    num_slices = 2
-    scaling = 0.5
-    dtype = torch.float16
-    device = "xpu:0"
-    lora_indices = torch.tensor([0, 1, -1, 0],
-                                dtype=torch.int32,
-                                device=device)
-    inputs = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
-    lora_a = [
-        torch.randn(num_loras,
-                    1,
-                    stored_rank,
-                    hidden_size,
-                    dtype=dtype,
-                    device=device) for _ in range(num_slices)
-    ]
-    output = torch.ones(num_slices,
-                        batch_size,
-                        active_rank,
-                        dtype=dtype,
-                        device=device)
-    expected = torch.zeros_like(output)
-    active_rows = lora_indices >= 0
-    active_indices = lora_indices[active_rows].long()
-    for slice_id, weight in enumerate(lora_a):
-        selected = weight[active_indices, 0, :active_rank]
-        expected[slice_id, active_rows] = scaling * torch.einsum(
-            "bi,boi->bo", inputs[active_rows], selected)
-
-    torch.ops._xpu_C.lora_shrink(inputs, lora_a, output, lora_indices, scaling)
-
-    assert_close(output, expected)
-
-
-@pytest.mark.parametrize("add_inputs", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output_slices", [[48], [48, 32], [48, 32, 16, 24]])
-def test_lora_linear_uses_active_rank_with_padded_weights(
-        add_inputs, dtype, output_slices):
-    batch_size = 4
-    hidden_size = 128
-    active_rank = 64
-    stored_rank = 128
-    num_loras = 2
-    scaling = 0.5
-    device = "xpu:0"
-    lora_indices = torch.tensor([0, 1, -1, 0],
-                                dtype=torch.int32,
-                                device=device)
-    inputs = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
-    lora_a = [
-        torch.randn(num_loras,
-                    1,
-                    stored_rank,
-                    hidden_size,
-                    dtype=dtype,
-                    device=device) for _ in output_slices
-    ]
-    lora_b = [
-        torch.randn(num_loras,
-                    1,
-                    output_size,
-                    stored_rank,
-                    dtype=dtype,
-                    device=device) for output_size in output_slices
-    ]
-    output = torch.randn(batch_size,
-                         sum(output_slices),
-                         dtype=dtype,
-                         device=device)
-    expected = output.clone()
-    active_rows = lora_indices >= 0
-    active_indices = lora_indices[active_rows].long()
-    offset = 0
-    for a, b, output_size in zip(lora_a, lora_b, output_slices):
-        selected_a = a[active_indices, 0, :active_rank]
-        shrunk = torch.einsum("bi,boi->bo", inputs[active_rows], selected_a)
-        selected_b = b[active_indices, 0, :, :active_rank]
-        expanded = scaling * torch.einsum("bi,boi->bo", shrunk, selected_b)
-        output_slice = slice(offset, offset + output_size)
-        if add_inputs:
-            expected[active_rows, output_slice] += expanded
-        else:
-            expected[active_rows, output_slice] = expanded
-        offset += output_size
-
-    xpu_ops.lora_linear(inputs,
-                        lora_a,
-                        lora_b,
-                        output,
-                        lora_indices,
-                        active_rank,
-                        scaling=scaling,
-                        add_inputs=add_inputs)
-
-    assert_close(output, expected)
-
-
 def check_lora_shrink_kernel(
     batches: int,
     num_loras: int,
@@ -256,8 +148,8 @@ def check_lora_shrink_kernel(
     input_dtype: torch.dtype = None,
 ):
     """
-    Compare outputs of torch_ops.sgmv_shrink and xpu_ops.lora_shrink
-    kernels.
+    Compare outputs of CPU reference sgmv_shrink and
+    xpu_ops.lora_shrink kernel.
     """
     data: PunicaTensors = generate_data_for_nslices(
         batches,
@@ -286,16 +178,28 @@ def check_lora_shrink_kernel(
     ref_out_tensor = data.ref_out_tensor
     out_tensor = data.our_out_tensor.clone()
 
-    # Preventing cache error pointer.
+    lora_meta = LoRAKernelMeta.make(
+        max_loras=num_loras,
+        max_num_tokens=token_nums,
+        device=device,
+    )
+    lora_meta.prepare_tensors(data.token_lora_mapping)
+
+    # lora_a_weights expects shape [num_loras, 1, rank, hidden_size]
+    lora_a_weights = [w.unsqueeze(1) for w in data.lora_weights]
+
     with _dict_lock:
-        for index in range(nslices):
-            xpu_ops.bgmv_shrink(
-                data.inputs_tensor,
-                data.lora_weights[index],
-                out_tensor[index],
-                data.token_lora_mapping,
-                scaling,
-            )
+        xpu_ops.lora_shrink(
+            data.inputs_tensor,
+            lora_a_weights,
+            out_tensor,
+            *lora_meta.meta_args(
+                token_nums=token_nums,
+                specialize_active_lora=False,
+            ),
+            scaling,
+        )
+
     # Reference
     sgmv_shrink_for_nslices(
         nslices,
@@ -322,8 +226,8 @@ def check_lora_expand_kernel(
     input_dtype: torch.dtype = None,
 ):
     """
-    Compare outputs of torch_ops.sgmv_expand and xpu_ops.lora_expand
-    kernels.
+    Compare outputs of CPU reference sgmv_expand and
+    xpu_ops.lora_expand kernel.
     """
     data: PunicaTensors = generate_data_for_nslices(
         batches,
@@ -350,26 +254,32 @@ def check_lora_expand_kernel(
         token_nums,
     )
 
-    # Setup metadata information for the LoRA kernel.
-
     # Setup output tensors
     ref_out_tensor = data.ref_out_tensor
     out_tensor = data.our_out_tensor.clone()
 
+    lora_meta = LoRAKernelMeta.make(
+        max_loras=num_loras,
+        max_num_tokens=token_nums,
+        device=device,
+    )
+    lora_meta.prepare_tensors(data.token_lora_mapping)
+
+    # lora_b_weights expects shape [num_loras, 1, slice_size, rank]
+    lora_b_weights = [w.unsqueeze(1) for w in data.lora_weights]
+
     with _dict_lock:
-        # lora_expand kernel
-        slice_offset = 0
-        for index in range(nslices):
-            xpu_ops.bgmv_expand_slice(
-                data.inputs_tensor[index],
-                data.lora_weights[index],
-                out_tensor,
-                data.token_lora_mapping,
-                slice_offset,
-                slice_size=hidden_size,
-                add_inputs=add_inputs,
-            )
-            slice_offset += hidden_size
+        xpu_ops.lora_expand(
+            data.inputs_tensor,
+            lora_b_weights,
+            out_tensor,
+            *lora_meta.meta_args(
+                token_nums=token_nums,
+                specialize_active_lora=False,
+            ),
+            offset_start=0,
+            add_inputs=add_inputs,
+        )
 
     # Reference
     sgmv_expand_for_nslices(
@@ -392,7 +302,7 @@ def check_lora_expand_kernel(
 #  etc.)
 
 # We have collected the hidden_sizes included in the LoRA models
-# currently supported by vLLM. It tests whether the corresponding Triton
+# currently supported by vLLM. It tests whether the corresponding
 # kernel can run normally when tensor parallelism is set to
 # [1, 2, 4, 8, 16, 32, 64].
 HIDDEN_SIZES = [
@@ -524,7 +434,7 @@ def test_kernels(
     op_type: str,
 ):
     """
-    Tests LoRA kernels.
+    Tests multi-slice LoRA kernels (lora_shrink / lora_expand).
     """
     torch.set_default_device(device)
     torch.xpu.set_device(device)
@@ -565,7 +475,7 @@ def test_kernels(
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", SEED)
 @pytest.mark.parametrize("op_type", ["shrink", "expand"])
-def test_kernels_hidden_size(
+def test_hidden_size(
     batches: int,
     num_loras: int,
     rank: int,
@@ -577,7 +487,7 @@ def test_kernels_hidden_size(
     op_type: str,
 ):
     """
-    Tests SGMV and LoRA kernels.
+    Tests multi-slice LoRA kernels with hidden_size variations.
     """
     torch.set_default_device(device)
     torch.xpu.set_device(device)
@@ -608,7 +518,6 @@ def test_kernels_hidden_size(
             add_inputs=True,
         )
 
-
 @pytest.mark.parametrize("batches", [1, 4, 16])
 @pytest.mark.parametrize("num_loras", [1, 8])
 @pytest.mark.parametrize("rank", [1, 16, 64])
@@ -619,15 +528,15 @@ def test_kernels_hidden_size(
 @pytest.mark.parametrize("seed", SEED)
 @pytest.mark.parametrize("op_type", ["shrink", "expand"])
 def test_kernels_mixed_precision(
-    batches: int,
-    num_loras: int,
-    rank: int,
-    hidden_size: int,
-    nslices: int,
-    weight_dtype: torch.dtype,
-    device: str,
-    seed: int,
-    op_type: str,
+        batches: int,
+        num_loras: int,
+        rank: int,
+        hidden_size: int,
+        nslices: int,
+        weight_dtype: torch.dtype,
+        device: str,
+        seed: int,
+        op_type: str,
 ):
     """
     Tests LoRA kernels with mixed precision:
