@@ -384,9 +384,11 @@ class XpuFusedMoe:
             (num_rows * self.n_experts_per_token, hidden_size),
             dtype=hidden_states.dtype,
             device=hidden_states.device)
-        rows_per_expert = torch.zeros((self.num_experts),
-                                                dtype=torch.int32,
-                                                device=hidden_states.device)
+        rows_per_expert = torch.empty((self.num_experts),
+                                      dtype=torch.int32,
+                                      device=hidden_states.device)
+        if num_moe_inputs > 256:
+            rows_per_expert.zero_()
         unpermuted_row_to_permuted_row = torch.empty(
             (num_rows, self.n_experts_per_token),
             dtype=torch.int32,
