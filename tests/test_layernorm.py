@@ -157,6 +157,32 @@ def test_rms_norm_float_weight(
         )
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@torch.inference_mode()
+def test_rms_norm_batched_weight(dtype: torch.dtype, device: str) -> None:
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+    input_shape = (2, 2, 4, 8)
+    epsilon = 1e-6
+    x = torch.randn(input_shape, dtype=dtype, device=device)
+    weight = torch.randn(
+        input_shape[0], input_shape[-1], dtype=torch.float32, device=device
+    )
+
+    x_float = x.float()
+    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+    ref_out = (
+        x_float
+        * torch.rsqrt(variance + epsilon)
+        * weight.view(input_shape[0], 1, 1, input_shape[-1])
+    ).to(dtype)
+
+    out = torch.empty_like(x)
+    torch.ops._C.rms_norm(out, x, weight, epsilon)
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("device", XPU_DEVICES)
 @pytest.mark.parametrize("tensor_name", ["out", "weight"])
 def test_rms_norm_rejects_mismatched_devices(
