@@ -683,8 +683,11 @@ def test_fused_moe_mxfp8(m, n, k, e, topk, dtype, has_bias):
                          ids=format_tc)
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("block_fp8_weights_nk", [False, True])
+@pytest.mark.parametrize("quantized_activation", [False, True])
+@pytest.mark.parametrize("permuted_experts", [False, True])
 def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
-                            block_fp8_weights_nk):
+                            block_fp8_weights_nk, quantized_activation,
+                            permuted_experts):
     """Native block-FP8 fused MoE (in-kernel scales) vs dequant-weight ref."""
     if not torch.xpu.is_available():
         pytest.skip("XPU required")
@@ -692,7 +695,9 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
     torch.xpu.empty_cache()
     gc.collect()
 
-    from vllm_xpu_kernels.moe_utils import dequant_fp8_block_wei
+    from vllm_xpu_kernels.moe_utils import (dequant_fp8_block_act,
+                                            dequant_fp8_block_wei,
+                                            quant_fp8_block_act)
 
     input_len = m
     hidden_size = n
@@ -702,6 +707,11 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
     assert intermediate_size % 128 == 0
 
     a = torch.randn((input_len, hidden_size), device=DEVICE, dtype=dtype) / 16
+    a_scale = None
+    ref_a = a
+    if quantized_activation:
+        a, a_scale = quant_fp8_block_act(a)
+        ref_a = dequant_fp8_block_act(a, a_scale).to(dtype)
     w13 = torch.empty(num_experts,
                       hidden_size,
                       2 * intermediate_size,
@@ -738,10 +748,9 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
                              2 * intermediate_size,
                              device=DEVICE,
                              dtype=torch.float32) / 16
-        w2_hp = torch.randn(intermediate_size,
-                            hidden_size,
-                            device=DEVICE,
-                            dtype=torch.float32) / 16
+        w2_hp = torch.randn(
+            intermediate_size, hidden_size, device=DEVICE,
+            dtype=torch.float32) / 16
         w13[i] = w13_hp.to(torch.float8_e4m3fn)
         w2[i] = w2_hp.to(torch.float8_e4m3fn)
         ref_13[i] = dequant_fp8_block_wei(w13[i], w13_scales[i]).to(dtype)
@@ -766,12 +775,16 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
                                                sorted=False)
     flat_expert_indices = expert_indices.view(-1)
     flat_expert_weights = expert_scores.view(-1, 1)
+    expert_map = None
+    if permuted_experts:
+        expert_map = torch.arange(e, device=DEVICE, dtype=torch.int32).roll(1)
+        flat_expert_indices = expert_map[flat_expert_indices].long()
 
     ref_13_nk = ref_13.transpose(-1, -2).contiguous()
     ref_2_nk = ref_2.transpose(-1, -2).contiguous()
-    ref_out = ref_fused_moe(a.clone(), ref_13_nk, w13_bias, ref_2_nk, w2_bias,
-                            flat_expert_weights, flat_expert_indices, topk,
-                            "silu", e)
+    ref_out = ref_fused_moe(ref_a.clone(), ref_13_nk, w13_bias, ref_2_nk,
+                            w2_bias, flat_expert_weights, flat_expert_indices,
+                            topk, "silu", e)
 
     if block_fp8_weights_nk:
         w13 = w13.transpose(-1, -2).contiguous()
@@ -808,6 +821,8 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
         hidden_states=a,
         topk_weights=expert_scores,
         topk_ids=expert_indices,
+        expert_map=expert_map,
+        a1q_scale=a_scale,
     )
     torch.testing.assert_close(output, ref_out, rtol=5e-2, atol=5e-2)
 
