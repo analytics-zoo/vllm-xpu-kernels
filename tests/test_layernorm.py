@@ -159,11 +159,13 @@ def test_rms_norm_float_weight(
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("input_shape", [(3, 769), (2, 3, 768),
+                                       (2, 2, 4, 128)])
 @torch.inference_mode()
-def test_rms_norm_batched_weight(dtype: torch.dtype, device: str) -> None:
+def test_rms_norm_batched_weight(dtype: torch.dtype, device: str,
+                                input_shape: tuple[int, ...]) -> None:
     torch.set_default_device("xpu")
     torch.xpu.set_device(device)
-    input_shape = (2, 2, 4, 8)
     epsilon = 1e-6
     x = torch.randn(input_shape, dtype=dtype, device=device)
     weight = torch.randn(
@@ -175,7 +177,8 @@ def test_rms_norm_batched_weight(dtype: torch.dtype, device: str) -> None:
     ref_out = (
         x_float
         * torch.rsqrt(variance + epsilon)
-        * weight.view(input_shape[0], 1, 1, input_shape[-1])
+        * weight.view(input_shape[0], *([1] * (len(input_shape) - 2)),
+                      input_shape[-1])
     ).to(dtype)
 
     out = torch.empty_like(x)

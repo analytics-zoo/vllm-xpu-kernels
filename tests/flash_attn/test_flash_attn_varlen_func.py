@@ -385,14 +385,15 @@ def test_varlen_with_paged_kv(
     torch.xpu.empty_cache()
 
 
+@pytest.mark.parametrize("query_lens", [(3, 4, 2), (3, 3, 3)])
 @torch.inference_mode()
-def test_varlen_per_seq_causal_all_prefill_local_window():
+def test_varlen_per_seq_causal_all_prefill_local_window(query_lens):
     """One FA2 prefill launch may mix causal and bidirectional sequences."""
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     torch.manual_seed(20260807)
 
-    query_lens = [3, 4, 2]
+    query_lens = list(query_lens)
     kv_lens = [9, 10, 8]
     per_seq_causal = [True, False, True]
     num_query_heads, num_kv_heads, head_size = 8, 2, 64
