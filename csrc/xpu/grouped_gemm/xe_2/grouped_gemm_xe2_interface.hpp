@@ -183,7 +183,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     at::Tensor& rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    bool block_fp8_weights_nk) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -205,6 +206,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       !is_B_mxfp8) {
     is_B_block_fp8 = (ptr_scales->dtype() == at::kFloat);
   }
+
+  TORCH_CHECK(
+      !block_fp8_weights_nk || is_B_block_fp8,
+      "block_fp8_weights_nk is only valid for block-FP8 weights");
 
   TORCH_CHECK(N % 8 == 0, "N must be divisible by 8");
 
@@ -228,6 +233,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   int B_E = ptr_B.size(0);
   int B_K = ptr_B.size(1);
   int B_N = ptr_B.size(2);
+  if (block_fp8_weights_nk) {
+    B_K = ptr_B.size(2);
+    B_N = ptr_B.size(1);
+  }
   if (is_B_int4 || is_B_mxfp4) {
     B_K = ptr_B.size(2) * 2;
     B_N = ptr_B.size(1);
@@ -534,8 +543,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(K % 128 == 0, "block-fp8 requires K divisible by 128");
     TORCH_CHECK(N % 128 == 0, "block-fp8 requires N divisible by 128");
     TORCH_CHECK(
-        ptr_scales->size(1) == (K / 128) && ptr_scales->size(2) == (N / 128),
-        "block-fp8 scales must be [E, K/128, N/128]; got [",
+        ptr_scales->size(1) == ((block_fp8_weights_nk ? N : K) / 128) &&
+            ptr_scales->size(2) == ((block_fp8_weights_nk ? K : N) / 128),
+        "block-fp8 scales must match the selected KN or NK weight layout; got "
+        "[",
         ptr_scales->size(0),
         ", ",
         ptr_scales->size(1),
@@ -552,48 +563,96 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
 #define W8BLOCKFP8LauncherCallER(policy)                                  \
   if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {            \
     using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
+    if (block_fp8_weights_nk) {                                           \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'C',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8_NK,                                          \
+          scalar_t,                                                       \
+          float_e4m3_t,                                                   \
+          float);                                                         \
+    } else {                                                              \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'R',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8,                                             \
+          scalar_t,                                                       \
+          float_e4m3_t,                                                   \
+          float);                                                         \
+    }                                                                     \
   } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {       \
     using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
+    if (block_fp8_weights_nk) {                                           \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'C',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8_NK,                                          \
+          scalar_t,                                                       \
+          float_e5m2_t,                                                   \
+          float);                                                         \
+    } else {                                                              \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'R',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8,                                             \
+          scalar_t,                                                       \
+          float_e5m2_t,                                                   \
+          float);                                                         \
+    }                                                                     \
   } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) { \
     using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
+    if (block_fp8_weights_nk) {                                           \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'C',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8_NK,                                          \
+          scalar_t,                                                       \
+          float_e4m3_t,                                                   \
+          float);                                                         \
+    } else {                                                              \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'R',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8,                                             \
+          scalar_t,                                                       \
+          float_e4m3_t,                                                   \
+          float);                                                         \
+    }                                                                     \
   } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {   \
     using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
+    if (block_fp8_weights_nk) {                                           \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'C',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8_NK,                                          \
+          scalar_t,                                                       \
+          float_e5m2_t,                                                   \
+          float);                                                         \
+    } else {                                                              \
+      MoEGEMMLauncherCallER(                                              \
+          'R',                                                            \
+          'R',                                                            \
+          policy,                                                         \
+          A_DTYPE::BITS16,                                                \
+          B_DTYPE::BLOCK_FP8,                                             \
+          scalar_t,                                                       \
+          float_e5m2_t,                                                   \
+          float);                                                         \
+    }                                                                     \
   } else {                                                                \
     TORCH_CHECK(                                                          \
         false,                                                            \

@@ -145,7 +145,7 @@ def test_remap_hidden_states(num_rows, hidden_size, total_experts_num, topk,
         remapped_scales = torch.empty_like(scales).repeat_interleave(topk,
                                                                      dim=0)
     if num_rows * topk <= 256:
-        rows_per_expert = torch.full((local_experts_num,),
+        rows_per_expert = torch.full((local_experts_num, ),
                                      -1,
                                      dtype=torch.int32,
                                      device=DEVICE)

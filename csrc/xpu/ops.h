@@ -84,7 +84,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
     torch::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts);
+    int64_t num_experts,
+    bool block_fp8_weights_nk);
 #endif
 
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(

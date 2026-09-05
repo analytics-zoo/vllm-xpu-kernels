@@ -415,7 +415,6 @@ struct gated_delta_rule_spec_kernel {
     const int token_start = query_start_loc[batch_id];
     const int token_end = query_start_loc[batch_id + 1];
     for (int t = token_start, t_local = 0; t < token_end; ++t, ++t_local) {
-
       float b_local = b[t * num_v_heads + num_v_heads_id];
       float beta = act_sigmoid(b_local);
       float a_local = a[t * num_v_heads + num_v_heads_id] + dt_bias_local;

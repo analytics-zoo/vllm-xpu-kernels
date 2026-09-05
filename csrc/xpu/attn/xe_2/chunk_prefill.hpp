@@ -233,7 +233,9 @@ struct KernelLauncher {
     compat::experimental::kernel_properties kernel_props{
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{
-        sycl_grid, sycl_block, kernel_props,
+        sycl_grid,
+        sycl_block,
+        kernel_props,
         compat::experimental::local_mem_size(smem_size)};
     compat::experimental::launch<chunk_prefill_graph_safe_kernel<FMHAKernel>>(
         policy, queue, params);

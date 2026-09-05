@@ -12,9 +12,7 @@ namespace vllm {
 
 template <int NUM_DIMS>
 inline int64_t rms_norm_weight_row(
-    int64_t global_row,
-    int64_t input_shape_d2,
-    int64_t input_shape_d3) {
+    int64_t global_row, int64_t input_shape_d2, int64_t input_shape_d3) {
   if constexpr (NUM_DIMS == 2) {
     return global_row;
   } else if constexpr (NUM_DIMS == 3) {
@@ -24,7 +22,12 @@ inline int64_t rms_norm_weight_row(
   }
 }
 
-template <typename scalar_t, typename weight_t, int NUM_DIMS, int VEC_SIZE, bool HasWeight>
+template <
+    typename scalar_t,
+    typename weight_t,
+    int NUM_DIMS,
+    int VEC_SIZE,
+    bool HasWeight>
 class rms_norm_kernel {
  public:
   rms_norm_kernel(
@@ -113,10 +116,9 @@ class rms_norm_kernel {
     scalar_t* out_row = out + item_ct1.get_group(2) * hidden_size;
     const weight_t* weight_row = weight;
     if (weight_stride != 0) {
-      weight_row +=
-          rms_norm_weight_row<NUM_DIMS>(
-              item_ct1.get_group(2), input_shape_d2, input_shape_d3) *
-          weight_stride;
+      weight_row += rms_norm_weight_row<NUM_DIMS>(
+                        item_ct1.get_group(2), input_shape_d2, input_shape_d3) *
+                    weight_stride;
     }
     auto* v_in =
         reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(input_row);
@@ -248,10 +250,9 @@ class rms_norm_kernel<scalar_t, weight_t, NUM_DIMS, 0, HasWeight> {
     scalar_t* out_row = out + item_ct1.get_group(2) * hidden_size;
     const weight_t* weight_row = weight;
     if (weight_stride != 0) {
-      weight_row +=
-          rms_norm_weight_row<NUM_DIMS>(
-              item_ct1.get_group(2), input_shape_d2, input_shape_d3) *
-          weight_stride;
+      weight_row += rms_norm_weight_row<NUM_DIMS>(
+                        item_ct1.get_group(2), input_shape_d2, input_shape_d3) *
+                    weight_stride;
     }
 #pragma unroll
     for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
@@ -549,7 +550,12 @@ void call_rms_norm_kernel(
         sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(grid * block, block),
-            rms_norm_kernel<sycl_t, sycl_weight_t, tensor_rank, vec_size, HasWeight>(
+            rms_norm_kernel<
+                sycl_t,
+                sycl_weight_t,
+                tensor_rank,
+                vec_size,
+                HasWeight>(
                 (sycl_t*)out_ptr,
                 (const sycl_t*)input_ptr,
                 input_stride_d2,
@@ -820,10 +826,10 @@ void call_fused_add_rms_norm_kernel(
   auto inp_ptr = reinterpret_cast<std::uintptr_t>(input_ptr);
   auto res_ptr = reinterpret_cast<std::uintptr_t>(residual_ptr);
   auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight_ptr);
-  bool ptrs_are_aligned =
-      inp_ptr % req_alignment_bytes == 0 &&
-      res_ptr % req_alignment_bytes == 0 &&
-      (weight_ptr == nullptr || wt_ptr % (vector_width * sizeof(weight_t)) == 0);
+  bool ptrs_are_aligned = inp_ptr % req_alignment_bytes == 0 &&
+                          res_ptr % req_alignment_bytes == 0 &&
+                          (weight_ptr == nullptr ||
+                           wt_ptr % (vector_width * sizeof(weight_t)) == 0);
   bool offsets_are_multiple_of_vector_width =
       hidden_size % vector_width == 0 && input_stride % vector_width == 0;
   bool can_vec = ptrs_are_aligned && offsets_are_multiple_of_vector_width;
@@ -838,7 +844,11 @@ void call_fused_add_rms_norm_kernel(
       sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
-          fused_add_rms_norm_kernel<sycl_t, sycl_weight_t, vector_width, HasWeight>(
+          fused_add_rms_norm_kernel<
+              sycl_t,
+              sycl_weight_t,
+              vector_width,
+              HasWeight>(
               (sycl_t*)input_ptr,
               (sycl_t*)residual_ptr,
               input_stride,
@@ -877,28 +887,33 @@ void rms_norm(
     std::optional<torch::Tensor> weight,
     double epsilon) {
   const at::DeviceGuard device_guard(input.device());
-  TORCH_CHECK(out.device() == input.device(),
-              "out and input must be on the same device");
-  TORCH_CHECK(out.sizes() == input.sizes(),
-              "out and input must have the same shape");
+  TORCH_CHECK(
+      out.device() == input.device(),
+      "out and input must be on the same device");
+  TORCH_CHECK(
+      out.sizes() == input.sizes(), "out and input must have the same shape");
   TORCH_CHECK(out.scalar_type() == input.scalar_type());
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) input = input.contiguous();
   if (weight.has_value()) {
-    TORCH_CHECK(weight->device() == input.device(),
-                "weight and input must be on the same device");
+    TORCH_CHECK(
+        weight->device() == input.device(),
+        "weight and input must be on the same device");
     TORCH_CHECK(weight->is_contiguous());
-    TORCH_CHECK(weight->dim() == 1 || weight->dim() == 2,
-                "weight must be 1D or 2D");
+    TORCH_CHECK(
+        weight->dim() == 1 || weight->dim() == 2, "weight must be 1D or 2D");
     if (weight->dim() == 2) {
-      TORCH_CHECK(weight->size(0) == input.size(0),
-                  "weight.size(0) must match input.size(0)");
+      TORCH_CHECK(
+          weight->size(0) == input.size(0),
+          "weight.size(0) must match input.size(0)");
     }
-    TORCH_CHECK(weight->size(-1) == input.size(-1),
-                "weight.numel() must match input.size(-1)");
-    TORCH_CHECK(weight->scalar_type() == input.scalar_type() ||
-                    weight->scalar_type() == at::ScalarType::Float,
-                "rms_norm weight must have the same dtype as input or be float32");
+    TORCH_CHECK(
+        weight->size(-1) == input.size(-1),
+        "weight.numel() must match input.size(-1)");
+    TORCH_CHECK(
+        weight->scalar_type() == input.scalar_type() ||
+            weight->scalar_type() == at::ScalarType::Float,
+        "rms_norm weight must have the same dtype as input or be float32");
   }
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "call_rms_norm_kernel", [&] {
@@ -907,11 +922,19 @@ void rms_norm(
               out, input, nullptr, epsilon);
         } else if (weight->scalar_type() == input.scalar_type()) {
           vllm::call_rms_norm_kernel<scalar_t, scalar_t, true>(
-              out, input, weight->data_ptr<scalar_t>(), epsilon, 0.0f,
+              out,
+              input,
+              weight->data_ptr<scalar_t>(),
+              epsilon,
+              0.0f,
               weight->dim() == 2 ? weight->stride(0) : 0);
         } else {
           vllm::call_rms_norm_kernel<scalar_t, float, true>(
-              out, input, weight->data_ptr<float>(), epsilon, 0.0f,
+              out,
+              input,
+              weight->data_ptr<float>(),
+              epsilon,
+              0.0f,
               weight->dim() == 2 ? weight->stride(0) : 0);
         }
       });
@@ -923,23 +946,29 @@ void fused_add_rms_norm(
     std::optional<torch::Tensor> weight,
     double epsilon) {
   const at::DeviceGuard device_guard(input.device());
-  TORCH_CHECK(residual.device() == input.device(),
-              "residual and input must be on the same device");
-  TORCH_CHECK(residual.sizes() == input.sizes(),
-              "residual and input must have the same shape");
-  TORCH_CHECK(input.stride(-1) == 1,
-              "input must be contiguous in the last dimension");
+  TORCH_CHECK(
+      residual.device() == input.device(),
+      "residual and input must be on the same device");
+  TORCH_CHECK(
+      residual.sizes() == input.sizes(),
+      "residual and input must have the same shape");
+  TORCH_CHECK(
+      input.stride(-1) == 1, "input must be contiguous in the last dimension");
   TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
   TORCH_CHECK(residual.scalar_type() == input.scalar_type());
   if (weight.has_value()) {
-    TORCH_CHECK(weight->device() == input.device(),
-                "weight and input must be on the same device");
+    TORCH_CHECK(
+        weight->device() == input.device(),
+        "weight and input must be on the same device");
     TORCH_CHECK(weight->is_contiguous());
-    TORCH_CHECK(weight->numel() == input.size(-1),
-                "weight.numel() must match input.size(-1)");
-    TORCH_CHECK(weight->scalar_type() == input.scalar_type() ||
-                    weight->scalar_type() == at::ScalarType::Float,
-                "fused_add_rms_norm weight must have the same dtype as input or be float32");
+    TORCH_CHECK(
+        weight->numel() == input.size(-1),
+        "weight.numel() must match input.size(-1)");
+    TORCH_CHECK(
+        weight->scalar_type() == input.scalar_type() ||
+            weight->scalar_type() == at::ScalarType::Float,
+        "fused_add_rms_norm weight must have the same dtype as input or be "
+        "float32");
   }
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "call_fused_add_rms_norm_kernel", [&] {
@@ -992,7 +1021,10 @@ void fused_add_gemma_rms_norm(
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "call_fused_add_gemma_rms_norm_kernel", [&] {
         const scalar_t* weight_ptr = weight.data_ptr<scalar_t>();
-        vllm::call_fused_add_rms_norm_kernel<scalar_t, scalar_t, /*HasWeight=*/true>(
+        vllm::call_fused_add_rms_norm_kernel<
+            scalar_t,
+            scalar_t,
+            /*HasWeight=*/true>(
             input, residual, weight_ptr, epsilon, /*weight_bias=*/1.0f);
       });
 }

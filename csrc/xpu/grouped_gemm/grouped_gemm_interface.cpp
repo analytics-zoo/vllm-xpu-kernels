@@ -19,7 +19,13 @@ torch::Tensor cutlass_grouped_gemm_interface(
     torch::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    bool block_fp8_weights_nk) {
+  TORCH_CHECK(
+      !block_fp8_weights_nk ||
+          (!vllm::xpu::force_xe_default_kernel() &&
+           (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch())),
+      "NK block-FP8 requires the native Xe2 grouped GEMM path");
   if (vllm::xpu::force_xe_default_kernel()) {
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
     int64_t groups = num_experts;
@@ -47,7 +53,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
         rows_per_expert,
         N,
         K,
-        num_experts);
+        num_experts,
+        block_fp8_weights_nk);
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif

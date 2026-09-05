@@ -258,8 +258,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
                      sycl::ext::oneapi::experimental::queue_state::recording;
     bool has_decode = false;
     if (!(capturing && per_seq_causal_.has_value())) {
-      has_decode = (seq_lens_q.numel() > 0) &&
-                   (seq_lens_q.eq(1).any().item<bool>());
+      has_decode =
+          (seq_lens_q.numel() > 0) && (seq_lens_q.eq(1).any().item<bool>());
     }
 
     cutlass_chunk_prefill_interface(
@@ -294,54 +294,53 @@ std::vector<at::Tensor> mha_varlen_fwd(
           window_size_left == -1 ? max_seqlen_k : window_size_left;
       int eff_window_right =
           window_size_right == -1 ? max_seqlen_k : window_size_right;
-      int effective_seqlen_k = is_local
-                                   ? std::min(max_seqlen_k, eff_window_left + 1)
-                                   : max_seqlen_k;
+      int effective_seqlen_k =
+          is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
 
-    int num_tokens = batch_size;
-    int num_heads_q = q.size(1);
-    int head_dim = q.size(2);
-    int num_heads_kv = k.size(2);
-    int kv_block_size = k.size(1);
+      int num_tokens = batch_size;
+      int num_heads_q = q.size(1);
+      int head_dim = q.size(2);
+      int num_heads_kv = k.size(2);
+      int kv_block_size = k.size(1);
 
-    int num_kv_splits = 1;
-    at::Tensor tmp_out = out;
-    at::Tensor decode_max_logits = at::empty(
-        {num_tokens, num_heads_q, num_kv_splits},
-        q.options().dtype(at::kFloat).device(q.device()));
-    at::Tensor decode_exp_sums = at::empty(
-        {num_tokens, num_heads_q, num_kv_splits},
-        q.options().dtype(at::kFloat).device(q.device()));
+      int num_kv_splits = 1;
+      at::Tensor tmp_out = out;
+      at::Tensor decode_max_logits = at::empty(
+          {num_tokens, num_heads_q, num_kv_splits},
+          q.options().dtype(at::kFloat).device(q.device()));
+      at::Tensor decode_exp_sums = at::empty(
+          {num_tokens, num_heads_q, num_kv_splits},
+          q.options().dtype(at::kFloat).device(q.device()));
 
-    cutlass_paged_decode_interface(
-        queue,
-        q,
-        k,
-        v,
-        out,
-        tmp_out,
-        decode_exp_sums,
-        decode_max_logits,
-        block_table,
-        cu_seqlens_q,
-        seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        k_scale,
-        v_scale,
-        softmax_scale,
-        softmax_sink_,
-        eff_window_left,
-        eff_window_right,
-        is_varlen,
-        is_paged,
-        false,  // is_causal: always false for decode;
-        is_local,
-        is_sink,
-        num_kv_splits,
-        is_prefill_opt,
-        splits_per_seq,
-        work_list);
+      cutlass_paged_decode_interface(
+          queue,
+          q,
+          k,
+          v,
+          out,
+          tmp_out,
+          decode_exp_sums,
+          decode_max_logits,
+          block_table,
+          cu_seqlens_q,
+          seqlens_k,
+          max_seqlen_q,
+          max_seqlen_k,
+          k_scale,
+          v_scale,
+          softmax_scale,
+          softmax_sink_,
+          eff_window_left,
+          eff_window_right,
+          is_varlen,
+          is_paged,
+          false,  // is_causal: always false for decode;
+          is_local,
+          is_sink,
+          num_kv_splits,
+          is_prefill_opt,
+          splits_per_seq,
+          work_list);
     }
   } else {
     // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic

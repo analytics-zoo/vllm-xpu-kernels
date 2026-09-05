@@ -74,7 +74,7 @@ def _get_weights_dtype(weight, scales):
     is_mxfp4 = weight_dtype == torch.float4_e2m1fn_x2
     is_mxfp8 = (is_fp8 and scales is not None and scales.dtype in (
         torch.uint8, torch.float8_e8m0fnu))
-    is_block_fp8 = (is_fp8 
+    is_block_fp8 = (is_fp8
                     and scales is not None
                     and scales.dtype == torch.float32
                     and scales.ndim == 3)
@@ -103,8 +103,16 @@ def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
         is_B_mxfp4=False)
 
 
-def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
-                             num_rows_per_expert, n, k, num_experts):
+def cutlass_grouped_gemm_xe2(input_A,
+                             input_B,
+                             scales,
+                             bias,
+                             output,
+                             num_rows_per_expert,
+                             n,
+                             k,
+                             num_experts,
+                             block_fp8_weights_nk=False):
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_A_scale=None,
@@ -115,7 +123,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         rows_per_expert=num_rows_per_expert,
         N=n,
         K=k,
-        num_experts=num_experts)
+        num_experts=num_experts,
+        block_fp8_weights_nk=block_fp8_weights_nk)
 
 
 def ceilDiv(a, b):
@@ -198,21 +207,27 @@ class XpuFusedMoe:
         ep_rank=0,
         ep_size=1,
         expert_map=None,
-        gemm1_clamp_limit: Optional[float]=None,
-        activation_situ_beta: Optional[float]=None,
-        activation_situ_linear_beta: Optional[float]=None,
+        gemm1_clamp_limit: Optional[float] = None,
+        activation_situ_beta: Optional[float] = None,
+        activation_situ_linear_beta: Optional[float] = None,
+        block_fp8_weights_nk: bool = False,
     ):
         assert w13.is_contiguous() and w2.is_contiguous()
 
-        (is_fp8, 
-         is_int4, 
-         is_mxfp4, 
-         is_mxfp8, 
+        (is_fp8,
+         is_int4,
+         is_mxfp4,
+         is_mxfp8,
          is_block_fp8) = _get_weights_dtype(w13, w13_scales)
+
+        if block_fp8_weights_nk and not is_block_fp8:
+            raise ValueError(
+                "NK layout is only supported for block-FP8 weights")
+        self.block_fp8_weights_nk = block_fp8_weights_nk
 
         # 4bits support [E, N, K]
         # other types [E, K, N]
-        if not is_int4 and not is_mxfp4:
+        if not is_int4 and not is_mxfp4 and not block_fp8_weights_nk:
             self.inter_size = w13.shape[-1] // 2
         else:
             self.inter_size = w13.shape[-2] // 2
@@ -338,24 +353,29 @@ class XpuFusedMoe:
         expert_map=None,
         a1q_scale=None,
     ):
-        return ref_fused_moe(recipe=self.recipe,
-                            output=output,
-                            hidden_states=hidden_states,
-                            w13=self.w13,
-                            w13_scales=self.gemm1_wei_scales,
-                            w13_bias=self.w13_bias,
-                            w2=self.w2,
-                            w2_scales=self.gemm2_wei_scales,
-                            w2_bias=self.w2_bias,
-                            topk_weights=topk_weights,
-                            topk_ids=topk_ids,
-                            n_experts_per_token=self.n_experts_per_token,
-                            activation=self.activation,
-                            num_experts=self.num_experts,
-                            ep_rank=self.ep_rank,
-                            ep_size=self.ep_size,
-                            expert_map=expert_map,
-                            a1q_scale=a1q_scale)
+        return ref_fused_moe(
+            recipe=self.recipe,
+            output=output,
+            hidden_states=hidden_states,
+            w13=(self.w13.transpose(-1, -2)
+                 if self.block_fp8_weights_nk else self.w13),
+            w13_scales=(self.gemm1_wei_scales.transpose(-1, -2) if
+                        self.block_fp8_weights_nk else self.gemm1_wei_scales),
+            w13_bias=self.w13_bias,
+            w2=(self.w2.transpose(-1, -2)
+                if self.block_fp8_weights_nk else self.w2),
+            w2_scales=(self.gemm2_wei_scales.transpose(-1, -2) if
+                       self.block_fp8_weights_nk else self.gemm2_wei_scales),
+            w2_bias=self.w2_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            n_experts_per_token=self.n_experts_per_token,
+            activation=self.activation,
+            num_experts=self.num_experts,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale)
 
     def _apply_kernel(
         self,
@@ -369,7 +389,7 @@ class XpuFusedMoe:
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
         act_quant = a1q_scale is not None
-        
+
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
@@ -433,7 +453,8 @@ class XpuFusedMoe:
             rows_per_expert=rows_per_expert,
             N=2 * self.inter_size,
             K=hidden_size,
-            num_experts=self.num_experts)
+            num_experts=self.num_experts,
+            block_fp8_weights_nk=self.block_fp8_weights_nk)
 
         # Apply swiglu_limit clamping before activation
         if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
@@ -487,7 +508,8 @@ class XpuFusedMoe:
             rows_per_expert=rows_per_expert,
             N=hidden_size,
             K=self.inter_size * self.inter_size_scale,
-            num_experts=self.num_experts)
+            num_experts=self.num_experts,
+            block_fp8_weights_nk=self.block_fp8_weights_nk)
 
         torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                     unpermuted_row_to_permuted_row,

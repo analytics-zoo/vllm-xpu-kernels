@@ -43,7 +43,7 @@ MINI_PYTEST_PARAMS = {
     "activation": ["silu"],
     "mode": ["prefill", "decode", "mix_mode"],
     "reorder_input": [False],
-    "dtype": [torch.float16], 
+    "dtype": [torch.float16],
     "ssm_state_is_fp32": [False],
     },
 }
@@ -837,9 +837,9 @@ def ref_gdn_attention_spec(
 @pytest.mark.parametrize("ragged", [False, True])
 @torch.inference_mode()
 def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
-                           head_k_dim, num_v_heads, head_v_dim, width,
-                           tp_size, has_bias, activation, reorder_input,
-                           dtype, ssm_state_is_fp32, ragged):
+                           head_k_dim, num_v_heads, head_v_dim, width, tp_size,
+                           has_bias, activation, reorder_input, dtype,
+                           ssm_state_is_fp32, ragged):
     """Pure spec-decode batch: num_prefills == num_decodes == 0,
     num_spec_decodes sequences each contributing num_spec_tokens tokens.
     Token positions are shuffled in the global buffer via spec_token_indx
@@ -1515,9 +1515,9 @@ def test_chunk_prepare_vhead_oob_guard(dtype):
 
 
 # chunk_update_states_kernel conv_elems guard coverage. When total conv_elems
-# is not a multiple of elems_per_group (1024), the last work-group is 
+# is not a multiple of elems_per_group (1024), the last work-group is
 # over-provisioned and requires an upper bound check to prevent out-of-bounds
-# memory writes. Qwen3.6-27B at TP=4 (local num_k_heads=4, num_v_heads=12) 
+# memory writes. Qwen3.6-27B at TP=4 (local num_k_heads=4, num_v_heads=12)
 # forces conv_elems = 2560. 2560 % 1024 != 0, exercising this guard.
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=format_tc)
@@ -1527,15 +1527,15 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
     random.seed(0)
     torch.manual_seed(0)
 
-    # Qwen-27B global heads: K=16, V=48. 
-    # At TP=4, local heads are K=4 and V=12. 
+    # Qwen-27B global heads: K=16, V=48.
+    # At TP=4, local heads are K=4 and V=12.
     tp_size = 4
     num_k_heads = 16
     num_v_heads = 48
     # local heads will be K=4, V=12 internally
     head_k_dim = 128
-    head_v_dim = 128 
-    
+    head_v_dim = 128
+
     width = 4
     activation = "silu"
     num_actual_tokens = 64  # single prefill
@@ -1544,13 +1544,13 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
 
     local_num_k_heads = num_k_heads // tp_size
     local_num_v_heads = num_v_heads // tp_size
-    
+
     mixed_qkvz_size = local_num_k_heads * (
         2 * head_k_dim + 2 * head_v_dim * \
         local_num_v_heads // local_num_k_heads)
     mixed_ba_size = local_num_k_heads * (
         2 * local_num_v_heads // local_num_k_heads)
-    
+
     # conv_elems will equal mixed_qkv_size (2560 here)
     mixed_qkv_size = local_num_k_heads * (
         2 * head_k_dim + head_v_dim * local_num_v_heads // local_num_k_heads)
@@ -1567,7 +1567,7 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
         (cache_batch_size, local_num_v_heads, head_v_dim, head_k_dim),
         dtype=dtype, device=device)
     ref_ssm_state = ssm_state.clone()
-        
+
     conv_weights = torch.randn(
         (mixed_qkv_size, width), dtype=dtype, device=device)
     conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)

@@ -718,7 +718,8 @@ struct causal_conv1d_spec_kernel {
     }
 
     for (int token_id_local = token_start, t_local = 0;
-         token_id_local < token_end; ++token_id_local, ++t_local) {
+         token_id_local < token_end;
+         ++token_id_local, ++t_local) {
       const int global_t = token_indx[token_id_local];
 
       // Shift window left by 1 (for t_local == 0 the trailing slot is fresh).

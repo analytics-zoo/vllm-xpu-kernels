@@ -150,7 +150,8 @@ CUTE_DEVICE void MoEGEMM(
       // Scales layout [E, N, K/group_size] (host transposes from [E,K/32,N]).
       ptr_Scales_curr_batch =
           const_cast<ElementS*>(Scales) + B_offset / group_size;
-    } else if constexpr (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8) {
+    } else if constexpr ((TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
+                          TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK)) {
       // Block-FP8: scales [E, K/128, N/128] kept in that order.
       ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) +
                               static_cast<int64_t>(expert_id) *
@@ -186,7 +187,8 @@ CUTE_DEVICE void MoEGEMM(
 
       if constexpr (
           is_B_4bits || TENSOR_B_DTYPE == B_DTYPE::MXFP8 ||
-          TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8) {
+          (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
+           TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK)) {
         // MXFP8 reuses the 4-bit block-scale mainloop (E8M0 decode + per-K
         // group B scaling) with float_e4m3/e5m2 weights instead of packed
         // 4-bit. Scale layout must be [N, K/group_size] per expert.

@@ -516,10 +516,9 @@ def flash_attn_varlen_func(
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
         if (block_table is not None and causal and per_seq_causal is None
-                and not return_softmax_lse
-                and softcap == 0.0 and alibi_slopes is None and q_v is None
-                and q_descale is None and scheduler_metadata is None
-                and seqused_k is not None
+                and not return_softmax_lse and softcap == 0.0
+                and alibi_slopes is None and q_v is None and q_descale is None
+                and scheduler_metadata is None and seqused_k is not None
                 and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
                 and is_uniform_qlen):
             return _spec_decode_varlen_fwd(
@@ -730,4 +729,3 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
-

@@ -401,19 +401,24 @@ def test_varlen_per_seq_causal_all_prefill_local_window(query_lens):
     window_size = (4, 2)
     dtype = torch.bfloat16
 
-    query = torch.randn(sum(query_lens), num_query_heads, head_size,
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
                         dtype=dtype)
-    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size,
+    key_cache = torch.randn(num_blocks,
+                            block_size,
+                            num_kv_heads,
+                            head_size,
                             dtype=dtype)
     value_cache = torch.randn_like(key_cache)
     cu_query_lens = torch.tensor([0] + query_lens,
                                  dtype=torch.int32).cumsum(dim=0,
                                                            dtype=torch.int32)
     seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
-    max_num_blocks = max((length + block_size - 1) // block_size
-                         for length in kv_lens)
-    block_tables = torch.randint(0, num_blocks,
-                                 (len(query_lens), max_num_blocks),
+    max_num_blocks = max(
+        (length + block_size - 1) // block_size for length in kv_lens)
+    block_tables = torch.randint(0,
+                                 num_blocks, (len(query_lens), max_num_blocks),
                                  dtype=torch.int32)
     causal_mask = torch.tensor(per_seq_causal, dtype=torch.bool)
 
@@ -441,19 +446,18 @@ def test_varlen_per_seq_causal_all_prefill_local_window(query_lens):
         # sequence in that same launch.
         window_size_right = window_size[1] if is_causal else window_size[0]
         expected.append(
-            ref_paged_attn(
-                query=query[offset:offset + query_len].contiguous(),
-                key_cache=key_cache,
-                value_cache=value_cache,
-                query_lens=[query_len],
-                kv_lens=[kv_len],
-                block_tables=block_tables[index:index + 1],
-                scale=head_size**-0.5,
-                casual=is_causal,
-                is_paged=True,
-                window_size_left=window_size[0],
-                window_size_right=window_size_right,
-                dtype=dtype))
+            ref_paged_attn(query=query[offset:offset + query_len].contiguous(),
+                           key_cache=key_cache,
+                           value_cache=value_cache,
+                           query_lens=[query_len],
+                           kv_lens=[kv_len],
+                           block_tables=block_tables[index:index + 1],
+                           scale=head_size**-0.5,
+                           casual=is_causal,
+                           is_paged=True,
+                           window_size_left=window_size[0],
+                           window_size_right=window_size_right,
+                           dtype=dtype))
         offset += query_len
 
     torch.testing.assert_close(output,

@@ -382,7 +382,7 @@ def test_fused_moe_int4(m, n, k, e, topk, dtype, has_bias):
     ref_out = ref_fused_moe(ref_a, ref_13, w13_bias, ref_2, w2_bias,
                             flat_expert_weights, flat_expert_indices, topk,
                             "silu", e)
-    
+
     fused_moe_impl = XpuFusedMoe(
                 w13=w13,
                 w13_scales=w13_scales,
@@ -682,7 +682,9 @@ def test_fused_moe_mxfp8(m, n, k, e, topk, dtype, has_bias):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
                          ids=format_tc)
 @pytest.mark.parametrize("has_bias", [True, False])
-def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias):
+@pytest.mark.parametrize("block_fp8_weights_nk", [False, True])
+def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
+                            block_fp8_weights_nk):
     """Native block-FP8 fused MoE (in-kernel scales) vs dequant-weight ref."""
     if not torch.xpu.is_available():
         pytest.skip("XPU required")
@@ -771,6 +773,12 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias):
                             flat_expert_weights, flat_expert_indices, topk,
                             "silu", e)
 
+    if block_fp8_weights_nk:
+        w13 = w13.transpose(-1, -2).contiguous()
+        w2 = w2.transpose(-1, -2).contiguous()
+        w13_scales = w13_scales.transpose(-1, -2).contiguous()
+        w2_scales = w2_scales.transpose(-1, -2).contiguous()
+
     fused_moe_impl = XpuFusedMoe(
         w13=w13,
         w13_scales=w13_scales,
@@ -781,7 +789,13 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias):
         n_experts_per_token=topk,
         activation="silu",
         num_experts=e,
+        block_fp8_weights_nk=block_fp8_weights_nk,
     )
+    assert fused_moe_impl.w13.data_ptr() == w13.data_ptr()
+    assert fused_moe_impl.w2.data_ptr() == w2.data_ptr()
+    assert fused_moe_impl.gemm1_wei_scales.data_ptr() == w13_scales.data_ptr()
+    assert fused_moe_impl.gemm2_wei_scales.data_ptr() == w2_scales.data_ptr()
+    assert fused_moe_impl.block_fp8_weights_nk == block_fp8_weights_nk
     assert fused_moe_impl.is_block_fp8
     assert not fused_moe_impl._block_fp8_promoted
     assert fused_moe_impl.gemm1_wei_scales is not None
@@ -1202,7 +1216,7 @@ def test_fused_moe_mxfp4_ep(m, n, k, e, topk, ep_rank, ep_size, dtype,
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS) 
+@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", [16])
 @pytest.mark.parametrize("topk", [1])
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=format_tc)

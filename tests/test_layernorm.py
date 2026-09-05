@@ -140,11 +140,12 @@ def test_rms_norm_float_weight(
             device=x.device,
         ).copy_(x)
         residual_out = residual.clone()
-        torch.ops._C.fused_add_rms_norm(
-            out, residual_out, weight, epsilon)
+        torch.ops._C.fused_add_rms_norm(out, residual_out, weight, epsilon)
         torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(
-            residual_out, ref_residual, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(residual_out,
+                                   ref_residual,
+                                   atol=0.0,
+                                   rtol=0.0)
         opcheck_out = torch.empty_strided(
             x.shape,
             x.stride(),
@@ -160,26 +161,24 @@ def test_rms_norm_float_weight(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", XPU_DEVICES)
 @pytest.mark.parametrize("input_shape", [(3, 769), (2, 3, 768),
-                                       (2, 2, 4, 128)])
+                                         (2, 2, 4, 128)])
 @torch.inference_mode()
 def test_rms_norm_batched_weight(dtype: torch.dtype, device: str,
-                                input_shape: tuple[int, ...]) -> None:
+                                 input_shape: tuple[int, ...]) -> None:
     torch.set_default_device("xpu")
     torch.xpu.set_device(device)
     epsilon = 1e-6
     x = torch.randn(input_shape, dtype=dtype, device=device)
-    weight = torch.randn(
-        input_shape[0], input_shape[-1], dtype=torch.float32, device=device
-    )
+    weight = torch.randn(input_shape[0],
+                         input_shape[-1],
+                         dtype=torch.float32,
+                         device=device)
 
     x_float = x.float()
     variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref_out = (
-        x_float
-        * torch.rsqrt(variance + epsilon)
-        * weight.view(input_shape[0], *([1] * (len(input_shape) - 2)),
-                      input_shape[-1])
-    ).to(dtype)
+    ref_out = (x_float * torch.rsqrt(variance + epsilon) * weight.view(
+        input_shape[0], *([1] *
+                          (len(input_shape) - 2)), input_shape[-1])).to(dtype)
 
     out = torch.empty_like(x)
     torch.ops._C.rms_norm(out, x, weight, epsilon)
@@ -200,8 +199,8 @@ def test_rms_norm_rejects_mismatched_devices(
     tensors[tensor_name] = tensors[tensor_name].cpu()
 
     with pytest.raises(
-        RuntimeError,
-        match=rf"{tensor_name} and input must be on the same device",
+            RuntimeError,
+            match=rf"{tensor_name} and input must be on the same device",
     ):
         torch.ops._C.rms_norm(
             tensors["out"],
@@ -225,8 +224,8 @@ def test_fused_add_rms_norm_rejects_mismatched_devices(
     tensors[tensor_name] = tensors[tensor_name].cpu()
 
     with pytest.raises(
-        RuntimeError,
-        match=rf"{tensor_name} and input must be on the same device",
+            RuntimeError,
+            match=rf"{tensor_name} and input must be on the same device",
     ):
         torch.ops._C.fused_add_rms_norm(
             x,
@@ -242,8 +241,8 @@ def test_rms_norm_rejects_mismatched_shapes(device: str) -> None:
     weight = torch.ones(8, dtype=torch.float32, device=device)
 
     with pytest.raises(
-        RuntimeError,
-        match="out and input must have the same shape",
+            RuntimeError,
+            match="out and input must have the same shape",
     ):
         torch.ops._C.rms_norm(
             torch.empty(1, 8, dtype=x.dtype, device=device),
@@ -253,8 +252,8 @@ def test_rms_norm_rejects_mismatched_shapes(device: str) -> None:
         )
 
     with pytest.raises(
-        RuntimeError,
-        match="residual and input must have the same shape",
+            RuntimeError,
+            match="residual and input must have the same shape",
     ):
         torch.ops._C.fused_add_rms_norm(
             x,
@@ -274,8 +273,8 @@ def test_rms_norm_rejects_wrong_weight_size(
     weight = torch.ones(7, dtype=torch.float32, device=device)
 
     with pytest.raises(
-        RuntimeError,
-        match=r"weight.numel\(\) must match input.size\(-1\)",
+            RuntimeError,
+            match=r"weight.numel\(\) must match input.size\(-1\)",
     ):
         if fused:
             torch.ops._C.fused_add_rms_norm(
@@ -311,8 +310,8 @@ def test_fused_add_rms_norm_rejects_unsupported_layout(
     if unsupported_tensor == "input":
         x = torch.randn(2, 16, dtype=torch.bfloat16, device=device)[:, ::2]
     else:
-        residual = torch.randn(
-            2, 16, dtype=torch.bfloat16, device=device)[:, :8]
+        residual = torch.randn(2, 16, dtype=torch.bfloat16,
+                               device=device)[:, :8]
     weight = torch.ones(8, dtype=torch.float32, device=device)
 
     with pytest.raises(RuntimeError, match=error):

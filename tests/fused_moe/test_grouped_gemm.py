@@ -527,7 +527,9 @@ def test_xe_grouped_gemm_mxfp8(m, n, k, e, topk, dtype, has_bias):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
                          ids=format_tc)
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_xe_grouped_gemm_block_fp8(m, n, k, e, topk, dtype, has_bias):
+@pytest.mark.parametrize("block_fp8_weights_nk", [False, True])
+def test_xe_grouped_gemm_block_fp8(m, n, k, e, topk, dtype, has_bias,
+                                   block_fp8_weights_nk):
     """Native block-FP8 W8A16 grouped GEMM vs dequant+matmul gold.
 
     Keeps FP8 weights + float32 2D scales [E, K/128, N/128] in memory.
@@ -567,8 +569,20 @@ def test_xe_grouped_gemm_block_fp8(m, n, k, e, topk, dtype, has_bias):
     init_rows_for_experts(m, topk, num_rows_per_expert)
 
     output = torch.empty((total_m, n), dtype=dtype, device=DEVICE)
-    cutlass_grouped_gemm_xe2(input_A, input_B, scale_B, bias, output,
-                             num_rows_per_expert, n, k, num_experts)
+    native_B = (input_B.transpose(-1, -2).contiguous()
+                if block_fp8_weights_nk else input_B)
+    native_scales = (scale_B.transpose(-1, -2).contiguous()
+                     if block_fp8_weights_nk else scale_B)
+    cutlass_grouped_gemm_xe2(input_A,
+                             native_B,
+                             native_scales,
+                             bias,
+                             output,
+                             num_rows_per_expert,
+                             n,
+                             k,
+                             num_experts,
+                             block_fp8_weights_nk=block_fp8_weights_nk)
 
     ref = []
     pre_token_sum = 0
