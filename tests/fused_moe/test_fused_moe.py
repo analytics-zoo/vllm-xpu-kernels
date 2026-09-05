@@ -687,7 +687,7 @@ def test_fused_moe_mxfp8(m, n, k, e, topk, dtype, has_bias):
 @pytest.mark.parametrize("permuted_experts", [False, True])
 def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
                             block_fp8_weights_nk, quantized_activation,
-                            permuted_experts):
+                            permuted_experts, record_property):
     """Native block-FP8 fused MoE (in-kernel scales) vs dequant-weight ref."""
     if not torch.xpu.is_available():
         pytest.skip("XPU required")
@@ -824,6 +824,12 @@ def test_fused_moe_fp8block(m, n, k, e, topk, dtype, has_bias,
         expert_map=expert_map,
         a1q_scale=a_scale,
     )
+    error = output.float() - ref_out.float()
+    record_property("max_abs_error", error.abs().max().item())
+    record_property("rmse", error.square().mean().sqrt().item())
+    record_property("relative_l2",
+                    (error.norm() /
+                     ref_out.float().norm().clamp_min(1e-12)).item())
     torch.testing.assert_close(output, ref_out, rtol=5e-2, atol=5e-2)
 
 
