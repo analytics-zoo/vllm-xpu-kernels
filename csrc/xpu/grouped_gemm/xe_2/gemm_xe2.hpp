@@ -352,6 +352,10 @@ CUTE_DEVICE void xe_gemm_4bits(
   int sg_local_id = cutlass::get_sub_group_local_id();
   int n_sg_start = sg_local_n_coord * SG_N;
   int group_num = get<1>(A.shape()) / group_size;
+  // Preserve downstream77b603 short-pitch scale-prefetch guard.
+  const bool can_prefetch_scales =
+      group_num * static_cast<int>(sizeof(ElementS)) >= 64 &&
+      (group_num * static_cast<int>(sizeof(ElementS))) % 16 == 0;
   int x_idx = sg_local_id / channel_num;
 
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
@@ -375,7 +379,7 @@ CUTE_DEVICE void xe_gemm_4bits(
     prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
 
-    if (k_tile_prefetch * group_size < shape<1>(A)) {
+    if (can_prefetch_scales && k_tile_prefetch * group_size < shape<1>(A)) {
       // MXFP8 / int4 1D scale prefetch ([N, K/gs]). Skip for float ElementS
       // (block-FP8 uses 2D [K/gs, N/gs] indexing).
       if constexpr (!((TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
@@ -462,7 +466,8 @@ CUTE_DEVICE void xe_gemm_4bits(
         }
       }
 
-      if ((group_idx + prefetch_dist) * group_size < shape<1>(A)) {
+      if (can_prefetch_scales &&
+          (group_idx + prefetch_dist) * group_size < shape<1>(A)) {
         if constexpr (!((TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
                          TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK))) {
           auto next_scales_tensor = make_tensor(
