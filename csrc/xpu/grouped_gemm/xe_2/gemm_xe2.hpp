@@ -356,6 +356,12 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num];
+  // A tile entirely inside one 128-column block needs only one scale.
+  static constexpr bool use_scalar_block_scale =
+      (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
+       TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK) &&
+      GroupSize == 128 && tile_n <= 128 && 128 % tile_n == 0;
+  scaleStoreType block_scale;
 
   clear(tCrC);
 
@@ -401,48 +407,58 @@ CUTE_DEVICE void xe_gemm_4bits(
     if (k_tile * tile_k % group_size == 0) {
       int group_idx = (k_tile * tile_k) / group_size;
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < thr_N; ++n) {
+      if constexpr (use_scalar_block_scale) {
+        int n_block = n_tile_start / group_size;
+        if constexpr (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK) {
+          block_scale = Scales[n_block * group_num + group_idx];
+        } else {
+          int n_blocks = static_cast<int>(get<0>(B.shape())) / group_size;
+          block_scale = Scales[group_idx * n_blocks + n_block];
+        }
+      } else {
         CUTLASS_PRAGMA_UNROLL
-        for (int c = 0; c < channel_num; ++c) {
-          int real_idx = x_idx + c * (sg_local_range / channel_num);
-          int sg_local_n = n * sg_local_range + real_idx;
-          scaleStoreType scale;
-          if constexpr (std::is_same_v<TB, int4_t>) {
-            scale = Scales
-                [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                 group_idx];
-          } else if constexpr (
-              std::is_same_v<TB, float_e2m1_t> ||
-              std::is_same_v<TB, float_e4m3_t> ||
-              std::is_same_v<TB, float_e5m2_t>) {
-            if constexpr ((TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
-                           TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK)) {
-              // Block-FP8: float32 scales [K/128, N/128] (B is (N,K)).
-              int n_global = n_tile_start + n_sg_start + sg_local_n;
-              int n_blocks = static_cast<int>(get<0>(B.shape())) / group_size;
-              int n_block = n_global / group_size;
-              int k_block = group_idx;
-              if constexpr (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK) {
-                scale = static_cast<scaleStoreType>(
-                    Scales[n_block * group_num + k_block]);
+        for (int n = 0; n < thr_N; ++n) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < channel_num; ++c) {
+            int real_idx = x_idx + c * (sg_local_range / channel_num);
+            int sg_local_n = n * sg_local_range + real_idx;
+            scaleStoreType scale;
+            if constexpr (std::is_same_v<TB, int4_t>) {
+              scale = Scales
+                  [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+                   group_idx];
+            } else if constexpr (
+                std::is_same_v<TB, float_e2m1_t> ||
+                std::is_same_v<TB, float_e4m3_t> ||
+                std::is_same_v<TB, float_e5m2_t>) {
+              if constexpr ((TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8 ||
+                             TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK)) {
+                // Block-FP8: float32 scales [K/128, N/128] (B is (N,K)).
+                int n_global = n_tile_start + n_sg_start + sg_local_n;
+                int n_blocks = static_cast<int>(get<0>(B.shape())) / group_size;
+                int n_block = n_global / group_size;
+                int k_block = group_idx;
+                if constexpr (TENSOR_B_DTYPE == B_DTYPE::BLOCK_FP8_NK) {
+                  scale = static_cast<scaleStoreType>(
+                      Scales[n_block * group_num + k_block]);
+                } else {
+                  scale = static_cast<scaleStoreType>(
+                      Scales[k_block * n_blocks + n_block]);
+                }
               } else {
+                // MXFP4 / MXFP8: uint8 E8M0 bits -> float via (bits << 23).
+                uint32_t scale_u32 =
+                    Scales
+                        [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+                         group_idx]
+                    << 23;
                 scale = static_cast<scaleStoreType>(
-                    Scales[k_block * n_blocks + n_block]);
+                    reinterpret_cast<float&>(scale_u32));
               }
-            } else {
-              // MXFP4 / MXFP8: uint8 E8M0 bits -> float via (bits << 23).
-              uint32_t scale_u32 =
-                  Scales
-                      [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                       group_idx]
-                  << 23;
-              scale = static_cast<scaleStoreType>(
-                  reinterpret_cast<float&>(scale_u32));
             }
-          }
 
-          scales[n * channel_num + c] = scale;
+            scales[n * channel_num + c] = scale;
+          }
         }
       }
 
@@ -482,10 +498,14 @@ CUTE_DEVICE void xe_gemm_4bits(
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
           if constexpr (std::is_same_v<TA, half_t>) {
-            tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
+            tCrB(cute::tuple(c, _), n, _)[i] *=
+                use_scalar_block_scale ? block_scale
+                                       : scales[n * channel_num + c];
           } else {
             tCrB(cute::tuple(c, _), n, _)[i] = apply_scale(
-                tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
+                tCrB(cute::tuple(c, _), n, _)[i],
+                use_scalar_block_scale ? block_scale
+                                       : scales[n * channel_num + c]);
           }
         }
       }

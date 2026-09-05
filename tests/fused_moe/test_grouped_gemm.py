@@ -521,7 +521,8 @@ def test_xe_grouped_gemm_mxfp8(m, n, k, e, topk, dtype, has_bias):
     torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 256, 256), (4, 256, 256)])
+@pytest.mark.parametrize("m,n,k", [(1, 256, 256), (4, 256, 256),
+                                   (128, 256, 256)])
 @pytest.mark.parametrize("e", [2])
 @pytest.mark.parametrize("topk", [1])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
