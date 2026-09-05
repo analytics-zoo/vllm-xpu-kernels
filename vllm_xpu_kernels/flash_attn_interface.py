@@ -131,6 +131,7 @@ def _spec_decode_varlen_fwd(
         False,  # is_mix_batch
         None,  # splits_per_seq
         None,  # work_list
+        None,  # per_seq_causal
     )
     return out
 
@@ -514,7 +515,8 @@ def flash_attn_varlen_func(
         # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
-        if (block_table is not None and causal and not return_softmax_lse
+        if (block_table is not None and causal and per_seq_causal is None
+                and not return_softmax_lse
                 and softcap == 0.0 and alibi_slopes is None and q_v is None
                 and q_descale is None and scheduler_metadata is None
                 and seqused_k is not None
