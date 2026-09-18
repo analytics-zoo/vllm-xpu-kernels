@@ -191,8 +191,11 @@ class cmake_build_ext(build_ext):
             "BASIC_KERNELS_ENABLED",
             "FA2_KERNELS_ENABLED",
             "MOE_KERNELS_ENABLED",
+            "RMS_KERNELS_ENABLED",
+            "FP16_LINEAR_KERNELS_ENABLED",
             "GDN_KERNELS_ENABLED",
             "MQA_LOGITS_KERNELS_ENABLED",
+            "LINEAR_TLA_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
         ]
@@ -576,6 +579,16 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._vllm_fa2_C"))
     if _is_enabled("MOE_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._moe_C"))
+    if _is_enabled("RMS_KERNELS_ENABLED"):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._rms_C"))
+    if (_is_enabled("FP16_LINEAR_KERNELS_ENABLED")
+            and _is_enabled("BUILD_SYCL_TLA_KERNELS")
+            and _is_enabled("VLLM_XPU_ENABLE_XE2")):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._fp16_C"))
+    if (_is_enabled("LINEAR_TLA_KERNELS_ENABLED")
+            and _is_enabled("BUILD_SYCL_TLA_KERNELS")
+            and _is_enabled("VLLM_XPU_ENABLE_XE2")):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._linear_C"))
     if _is_enabled("XPU_SPECIFIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._xpu_C"))
     if _is_enabled("XPUMEM_ALLOCATOR_ENABLED"):
