@@ -119,5 +119,24 @@ M=1、D=2816 的设备 kernel 中位耗时：
 - 同一torch接口内的融合不新增vLLM改动；默认安装已同步。M1 MoE继续含routing共4 kernels；尝试的3-kernel并行专家归约未证明稳定完整调用收益，保留隔离参考。
 - 原始证据：gemma_upstream_port_v2_20260917/m1_v8；消费者组合不含attention/collective，不替代完整服务TPOT；本轮未运行服务E2E。
 
+### 原有ABI的库内转接（2026-09-17，legacy_bridge_v11）
 
-本提交仅提供实现、注册及构建入口；原有 ABI 的默认转接在后一提交中接入。
+- 原 `_xpu_C.fp8_gemm_w8a16` 在支持的小M/Gemma TP2形状下调用新的内部 `try_fp8_gemm_w8a16_tla`，不支持时仍由原入口执行fallback。try入口先完整检查，返回Tensor或None，不调用原op，避免双向转接递归。
+- 原 `_C.rms_norm` 转到 `rms_norm_small_m.out`；原 `_C.gelu_tanh_and_mul` 转到 `gelu_tanh_and_mul_small_m`；原 `_C.rotary_embedding` 对NeoX且有K的调用尝试 `try_rotary_embedding_small_m`。没有新增输出copy kernel。
+- 保持原公开schema和vLLM源码不变。dtype/shape/stride/输出别名等契约不满足或可选扩展缺失时仍使用原实现；不通过Python monkey patch或重复Torch注册实现转接。
+- 无weight RMSNorm在vLLM里已经创建全1权重，该提交无法在库内部消除；FP16 F.linear及Gemma Triton routing绕过此库，仍需vLLM的XPU接线。
+- 已完成部分编译，原公开接口123项数值/实际kernel检查、缺扩展23项回退检查通过；三份SO已同步wj-test-new-0.26.0默认安装，原件保留。证据为 `legacy_bridge_v11/{build_manifest,validation_candidate,validation_missing,deployment}.json`；完整服务trace/四版本E2E随后核对。原有M1/M2..8算法策略不变。
+
+### QKV步长输入的默认Norm转接修正（2026-09-17，legacy_bridge_v12）
+
+- v11真实服务trace发现：M=1已全部命中新RMS；M>1的Q/K/V切片因overlap分析返回TooHard而被旧入口的严格No条件误拒，回到原RMS。新SmallMRms本身支持该stride，无需改vLLM或新算法。
+- 原入口先检查是否共享storage；不同storage无需重叠分析，共享storage仍只接受明确No的情况。保留原地别名回退，不增加copy或kernel。
+- 只重编layernorm.cpp并复用v11其余_C对象重新链接；源码、对象及安装SO哈希和原件均保留于legacy_bridge_v12。
+- 48个真实Q/K/V切片（M1..8、D256/512）数值、原地别名回退、非默认stream通过。旧安装trace未命中新RMS，候选及默认安装均命中；默认_C已同步。两种接线方式的M1/M8均完成双rank真实decode trace：FP8、RMS、RoPE、GELU及MoE全部命中新kernel；无接线版每rank四step的1324次旧RMS调用全部转到新RMS，旧RMS设备kernel为0。有接线版另命中新FP16 Linear/routing。两版acc.sh各5/5，四server×B1..8的32组已核对；性能以v12主表为准。
+
+### Linear 分派整理（2026-09-18）
+
+- 新增可选 `_fp16_C` 接口 `_xpu_C.unquantized_gemm(input, weight, bias=None)`，保持 Linear 输入/输出语义；具体支持条件由 native 检查。仅无 bias、FP16、M1..8、K2816/N128、连续且64字节对齐、BMG-G31 的 Router 使用已有 TLA。
+- LM head 及其他输入走 `at::linear`；沿用已验证的未对齐 XPU 输入/权重对齐回退。原 `fp16_nt_gemm` 保留历史 Router/LM head 实验能力，算法不变。
+- vLLM `layers/utils.py` 提供薄 XPU 分派，旧包缺少新接口时直接 `F.linear`；不再依赖独立 `layers/xpu_linear.py`，不修改模型 forward、IR 注册或 CUDA/CPU 分派。
+- 本条源码与验证证据位于 `gemma_upstream_port_v2_20260917/linear_dispatch_review_20260918/`；不继承旧 TPOT 作为本次重测结果。

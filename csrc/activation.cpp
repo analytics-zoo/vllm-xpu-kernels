@@ -4,6 +4,8 @@
 #include <numeric>
 #include "utils.h"
 #include "dispatch_utils.h"
+#include <ATen/MemoryOverlap.h>
+#include "xpu/decode/legacy_dispatch.h"
 
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Float8_e5m2.h>
@@ -587,6 +589,21 @@ void gelu_tanh_and_mul(
     torch::Tensor& out,    // [..., d]
     torch::Tensor& input)  // [..., 2 * d]
 {
+  using Fast = void(at::Tensor, const at::Tensor&);
+  static auto fast = vllm::decode::optional_operator<Fast>(
+      "_xpu_C::gelu_tanh_and_mul_small_m");
+  if (fast && input.is_xpu() && input.scalar_type() == at::kHalf &&
+      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 64 &&
+      (input.size(1) == 704 || input.size(1) == 2112) &&
+      input.is_contiguous() && out.device() == input.device() &&
+      out.scalar_type() == at::kHalf && out.dim() == 2 &&
+      out.size(0) == input.size(0) && out.size(1) * 2 == input.size(1) &&
+      out.is_contiguous() && uintptr_t(input.data_ptr()) % 8 == 0 &&
+      uintptr_t(out.data_ptr()) % 8 == 0 &&
+      at::get_overlap_status(out, input) == at::MemOverlapStatus::No) {
+    fast->call(out, input);
+    return;
+  }
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL_VEC(vllm::gelu_tanh_kernel, true);
   });

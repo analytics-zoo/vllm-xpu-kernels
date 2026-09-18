@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <ATen/DeviceGuard.h>
+#include <ATen/MemoryOverlap.h>
+#include "xpu/decode/legacy_dispatch.h"
 #include "utils.h"
 #include "dispatch_utils.h"
 #include "quantization/utils.h"
@@ -726,6 +728,29 @@ void rms_norm(
     torch::Tensor& input,
     torch::Tensor& weight,
     double epsilon) {
+  using Fast = void(
+      at::Tensor, const at::Tensor&, const std::optional<at::Tensor>&, double);
+  static auto fast =
+      vllm::decode::optional_operator<Fast>("_xpu_C::rms_norm_small_m", "out");
+  if (fast && input.is_xpu() && input.scalar_type() == at::kHalf &&
+      input.dim() >= 2 && input.dim() <= 4 && input.size(0) >= 1 &&
+      input.size(0) <= 8 && input.stride(-1) == 1 && epsilon >= 0 &&
+      (input.size(-1) == 256 || input.size(-1) == 512 ||
+       input.size(-1) == 2816) &&
+      input.numel() / input.size(-1) >= 1 &&
+      input.numel() / input.size(-1) <= 128 &&
+      weight.device() == input.device() && weight.scalar_type() == at::kHalf &&
+      weight.dim() == 1 && weight.numel() == input.size(-1) &&
+      weight.is_contiguous() && out.device() == input.device() &&
+      out.scalar_type() == at::kHalf && out.sizes() == input.sizes() &&
+      out.is_contiguous() &&
+      (!out.is_alias_of(input) ||
+       at::get_overlap_status(out, input) == at::MemOverlapStatus::No) &&
+      (!out.is_alias_of(weight) ||
+       at::get_overlap_status(out, weight) == at::MemOverlapStatus::No)) {
+    fast->call(out, input, weight, epsilon);
+    return;
+  }
   const at::DeviceGuard device_guard(input.device());
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {

@@ -292,6 +292,15 @@ bool supported(
   return last_supported;
 }
 
+std::optional<at::Tensor> try_fp8_gemm(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& scale,
+    const std::optional<at::Tensor>& bias) {
+  if (!supported(input, weight, scale, bias)) return std::nullopt;
+  return fp8_gemm_w8a16(input, weight, scale, bias);
+}
+
 at::Tensor fp8_gemm_dispatch(
     const at::Tensor& input,
     const at::Tensor& weight,
@@ -339,6 +348,13 @@ at::Tensor fp8_gemm_meta(
 }  // namespace vllm::linear_tla
 
 TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
+  // No fallback here: the original API owns fallback selection, avoiding
+  // recursion.
+  m.def(
+      "try_fp8_gemm_w8a16_tla(Tensor A, Tensor B, Tensor? B_scale_, Tensor? "
+      "bias_=None) -> Tensor?");
+  m.impl(
+      "try_fp8_gemm_w8a16_tla", torch::kXPU, &vllm::linear_tla::try_fp8_gemm);
   m.def(
       "fp8_gemm_w8a16_tla(Tensor A, Tensor B, Tensor? B_scale_, Tensor? "
       "bias_=None) -> Tensor");

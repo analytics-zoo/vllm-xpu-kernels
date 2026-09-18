@@ -11,6 +11,7 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace vllm::fp16_linear_tla {
 
@@ -162,10 +163,10 @@ bool fp16_tla_supported(const at::Tensor& input, const at::Tensor& weight) {
   return last_supported;
 }
 
-at::Tensor fp16_nt_gemm(const at::Tensor& input, const at::Tensor& weight) {
-  if (fp16_tla_supported(input, weight)) {
-    return fp16_nt_gemm_impl(input, weight);
-  }
+at::Tensor linear_fallback(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias) {
   // Upstream oneDNN can miscompute FP16 GEMM with an unaligned activation
   // address. Keep ordinary fallbacks unchanged, but realign only tensors whose
   // addresses do not meet the 2D-I/O alignment. These copies are confined to
@@ -182,9 +183,36 @@ at::Tensor fp16_nt_gemm(const at::Tensor& input, const at::Tensor& weight) {
         reinterpret_cast<uintptr_t>(weight.data_ptr()) % 64 != 0) {
       aligned_weight = weight.clone(at::MemoryFormat::Contiguous);
     }
-    return at::linear(aligned_input, aligned_weight);
+    return at::linear(aligned_input, aligned_weight, bias);
   }
-  return at::linear(input, weight);
+  return at::linear(input, weight, bias);
+}
+
+at::Tensor fp16_nt_gemm(const at::Tensor& input, const at::Tensor& weight) {
+  if (fp16_tla_supported(input, weight)) {
+    return fp16_nt_gemm_impl(input, weight);
+  }
+  return linear_fallback(input, weight, std::nullopt);
+}
+
+at::Tensor unquantized_gemm(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias) {
+  // Only the narrow-N router has demonstrated an end-to-end gain.
+  // Keep the LM-head TLA candidate available through fp16_nt_gemm for experiments.
+  if (!bias.has_value() && weight.dim() == 2 &&
+      weight.size(0) == kRouterN && fp16_tla_supported(input, weight)) {
+    return fp16_nt_gemm_impl(input, weight);
+  }
+  return linear_fallback(input, weight, bias);
+}
+
+at::Tensor unquantized_gemm_meta(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias) {
+  return at::linear(input, weight, bias);
 }
 
 at::Tensor fp16_nt_gemm_meta(const at::Tensor& input, const at::Tensor& weight) {
@@ -196,6 +224,11 @@ at::Tensor fp16_nt_gemm_meta(const at::Tensor& input, const at::Tensor& weight) 
 }  // namespace vllm::fp16_linear_tla
 
 TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
+  m.def("unquantized_gemm(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor");
+  m.impl("unquantized_gemm", torch::kXPU,
+         &vllm::fp16_linear_tla::unquantized_gemm);
+  m.impl("unquantized_gemm", torch::kMeta,
+         &vllm::fp16_linear_tla::unquantized_gemm_meta);
   m.def("fp16_nt_gemm(Tensor input, Tensor weight) -> Tensor");
   m.impl("fp16_nt_gemm", torch::kXPU,
          &vllm::fp16_linear_tla::fp16_nt_gemm);
