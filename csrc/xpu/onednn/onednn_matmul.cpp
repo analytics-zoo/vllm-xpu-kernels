@@ -4,6 +4,7 @@
 #include "fp8_gemm_w8a16.h"
 #include "int4_gemm_w4a16.h"
 #include "int4_gemm_w4a8.h"
+#include "../decode/legacy_dispatch.h"
 
 inline bool is_supported_fp8(at::ScalarType t) {
   return (t == at::ScalarType::Float8_e5m2) ||
@@ -128,6 +129,17 @@ torch::Tensor fp8_gemm_w8a16(
     const torch::Tensor& B,
     const std::optional<torch::Tensor>& B_scale_,
     const std::optional<torch::Tensor>& bias_) {
+  using Fast = std::optional<at::Tensor>(
+      const at::Tensor&,
+      const at::Tensor&,
+      const std::optional<at::Tensor>&,
+      const std::optional<at::Tensor>&);
+  static auto fast =
+      vllm::decode::optional_operator<Fast>("_xpu_C::try_fp8_gemm_w8a16_tla");
+  if (fast) {
+    auto output = fast->call(A, B, B_scale_, bias_);
+    if (output) return *output;
+  }
   const at::DeviceGuard device_guard(A.device());
   torch::Tensor result = check_and_create_output_tensor(A, B, A.scalar_type());
   TORCH_CHECK(

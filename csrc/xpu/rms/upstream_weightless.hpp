@@ -2,13 +2,11 @@
 
 #include <algorithm>
 #include <ATen/DeviceGuard.h>
-#include <ATen/MemoryOverlap.h>
-#include "xpu/decode/legacy_dispatch.h"
 #include "utils.h"
 #include "dispatch_utils.h"
 #include "quantization/utils.h"
 
-namespace vllm {
+namespace vllm_weightless_rms {
 
 template <typename scalar_t, int NUM_DIMS, int VEC_SIZE>
 class rms_norm_kernel {
@@ -95,7 +93,6 @@ class rms_norm_kernel {
     scalar_t* out_row = out + item_ct1.get_group(2) * hidden_size;
     auto* v_in =
         reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(input_row);
-    auto* v_w = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(weight);
     auto* v_out = reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(out_row);
     int64_t const out_num_vec_elems = hidden_size / VEC_SIZE;
     float s_variance_val = *s_variance_ptr;
@@ -103,11 +100,10 @@ class rms_norm_kernel {
          idx += item_ct1.get_local_range(2)) {
       vec_n_t<scalar_t, VEC_SIZE> dst;
       vec_n_t<scalar_t, VEC_SIZE> src1 = v_in[idx];
-      vec_n_t<scalar_t, VEC_SIZE> src2 = v_w[idx];
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; j++) {
         float x = static_cast<float>(src1.val[j]);
-        dst.val[j] = ((scalar_t)(x * s_variance_val)) * src2.val[j];
+        dst.val[j] = (scalar_t)(x * s_variance_val);
       }
       v_out[idx] = dst;
     }
@@ -209,7 +205,7 @@ class rms_norm_kernel<scalar_t, NUM_DIMS, 0> {
     for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
          idx += item_ct1.get_local_range(2)) {
       float x = (float)input_row[idx];
-      out_row[idx] = ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
+      out_row[idx] = (scalar_t)(x * (*s_variance_ptr));
     }
   }
 
@@ -332,18 +328,16 @@ class rms_norm_multi_row_kernel {
     scalar_t* out_row = out + global_row * hidden_size;
     auto* v_in =
         reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(input_row);
-    auto* v_w = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(weight);
     auto* v_out = reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(out_row);
     float s_var = s_variance_ptr[row_in_wg];
 
     for (int idx = col_id; idx < num_vec_elems; idx += col_range) {
       vec_n_t<scalar_t, VEC_SIZE> dst;
       vec_n_t<scalar_t, VEC_SIZE> src1 = v_in[idx];
-      vec_n_t<scalar_t, VEC_SIZE> src2 = v_w[idx];
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; j++) {
         float x = static_cast<float>(src1.val[j]);
-        dst.val[j] = ((scalar_t)(x * s_var)) * src2.val[j];
+        dst.val[j] = (scalar_t)(x * s_var);
       }
       v_out[idx] = dst;
     }
@@ -368,7 +362,6 @@ template <typename scalar_t>
 void call_rms_norm_kernel(
     torch::Tensor& out,
     torch::Tensor& input,
-    torch::Tensor& weight,
     float epsilon) {
   using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
   int hidden_size = input.size(-1);
@@ -382,10 +375,10 @@ void call_rms_norm_kernel(
 
   auto out_ptr = out.data_ptr<scalar_t>();
   auto input_ptr = input.data_ptr<scalar_t>();
-  auto weight_ptr = weight.data_ptr<scalar_t>();
+  scalar_t* weight_ptr = nullptr;
 
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-  auto& queue = vllm::xpu::vllmGetQueue();
+  auto& queue = c10::xpu::getCurrentXPUStream(input.get_device()).queue();
 
   constexpr int vec_size = (sizeof(scalar_t) == 2) ? 8 : 4;
   constexpr int req_alignment_bytes = vec_size * sizeof(scalar_t);
@@ -500,282 +493,4 @@ void call_rms_norm_kernel(
   }
 }
 
-template <typename scalar_t, int width>
-class fused_add_rms_norm_kernel {
- public:
-  fused_add_rms_norm_kernel(
-      scalar_t* __restrict__ input_,     // [..., hidden_size]
-      scalar_t* __restrict__ residual_,  // [..., hidden_size]
-      const int64_t input_stride_,
-      const scalar_t* __restrict__ weight_,  // [hidden_size]
-      const float epsilon_,
-      const int num_tokens_,
-      const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
-      : input(input_),
-        residual(residual_),
-        input_stride(input_stride_),
-        weight(weight_),
-        epsilon(epsilon_),
-        num_tokens(num_tokens_),
-        hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
-
-  void operator() [[sycl::reqd_sub_group_size(32)]] (
-      const sycl::nd_item<3>& item_ct1) const {
-    static_assert(width > 0, "Use width=0 specialization for scalar path");
-    using vec_t = vec_n_t<scalar_t, width>;
-
-    const int vec_hidden_size = hidden_size / width;
-    const int64_t vec_input_stride = input_stride / width;
-
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
-
-    auto* __restrict__ input_v = reinterpret_cast<vec_t*>(input);
-    auto* __restrict__ residual_v = reinterpret_cast<vec_t*>(residual);
-    auto* __restrict__ weight_v = reinterpret_cast<const vec_t*>(weight);
-
-    for (int idx = item_ct1.get_local_id(2); idx < vec_hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      int id = item_ct1.get_group(2) * vec_hidden_size + idx;
-      int64_t strided_id = item_ct1.get_group(2) * vec_input_stride + idx;
-      vec_t temp = input_v[strided_id];
-      vec_t res = residual_v[id];
-#pragma unroll
-      for (int i = 0; i < width; i++) {
-        temp.val[i] += res.val[i];
-        float x = static_cast<float>(temp.val[i]);
-        variance += x * x;
-      }
-      residual_v[id] = temp;
-    }
-
-    variance = sycl::reduce_over_group(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    float s_var = *s_variance_ptr;
-    for (int idx = item_ct1.get_local_id(2); idx < vec_hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      int id = item_ct1.get_group(2) * vec_hidden_size + idx;
-      int64_t strided_id = item_ct1.get_group(2) * vec_input_stride + idx;
-      vec_t res = residual_v[id];
-      vec_t w = weight_v[idx];
-      vec_t out;
-#pragma unroll
-      for (int i = 0; i < width; i++) {
-        float x = static_cast<float>(res.val[i]);
-        out.val[i] = static_cast<scalar_t>(x * s_var) * w.val[i];
-      }
-      input_v[strided_id] = out;
-    }
-  }
-
- private:
-  scalar_t* __restrict__ input;     // [..., hidden_size]
-  scalar_t* __restrict__ residual;  // [..., hidden_size]
-  const int64_t input_stride;
-  const scalar_t* __restrict__ weight;  // [hidden_size]
-  const float epsilon;
-  const int num_tokens;
-  const int hidden_size;
-  sycl::local_accessor<float, 1> s_variance;  // local memory for variance
-};
-
-template <typename scalar_t>
-class fused_add_rms_norm_kernel<scalar_t, 0> {
- public:
-  fused_add_rms_norm_kernel(
-      scalar_t* __restrict__ input_,     // [..., hidden_size]
-      scalar_t* __restrict__ residual_,  // [..., hidden_size]
-      const int64_t input_stride_,
-      const scalar_t* __restrict__ weight_,  // [hidden_size]
-      const float epsilon_,
-      const int num_tokens_,
-      const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
-      : input(input_),
-        residual(residual_),
-        input_stride(input_stride_),
-        weight(weight_),
-        epsilon(epsilon_),
-        num_tokens(num_tokens_),
-        hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
-
-  void operator() [[sycl::reqd_sub_group_size(32)]] (
-      const sycl::nd_item<3>& item_ct1) const {
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
-
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      scalar_t z = (scalar_t)input[item_ct1.get_group(2) * input_stride + idx];
-      z += residual[item_ct1.get_group(2) * hidden_size + idx];
-      float x = (float)z;
-      variance += x * x;
-      residual[item_ct1.get_group(2) * hidden_size + idx] = z;
-    }
-
-    variance = sycl::reduce_over_group(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float x = (float)residual[item_ct1.get_group(2) * hidden_size + idx];
-      input[item_ct1.get_group(2) * input_stride + idx] =
-          ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
-    }
-  }
-
- private:
-  scalar_t* __restrict__ input;     // [..., hidden_size]
-  scalar_t* __restrict__ residual;  // [..., hidden_size]
-  const int64_t input_stride;
-  const scalar_t* __restrict__ weight;  // [hidden_size]
-  const float epsilon;
-  const int num_tokens;
-  const int hidden_size;
-  sycl::local_accessor<float, 1> s_variance;  // local memory for variance
-};
-
-template <typename scalar_t>
-void call_fused_add_rms_norm_kernel(
-    torch::Tensor& input,
-    torch::Tensor& residual,
-    torch::Tensor& weight,
-    float epsilon) {
-  using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
-  int hidden_size = input.size(-1);
-  int num_tokens = input.numel() / hidden_size;
-  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-  auto input_ptr = input.data_ptr<scalar_t>();
-  auto residual_ptr = residual.data_ptr<scalar_t>();
-  auto weight_ptr = weight.data_ptr<scalar_t>();
-  int64_t input_stride = input.stride(-2);
-
-  constexpr int vector_width = (sizeof(scalar_t) == 2) ? 8 : 4;
-  constexpr int req_alignment_bytes = vector_width * sizeof(scalar_t);
-  auto inp_ptr = reinterpret_cast<std::uintptr_t>(input_ptr);
-  auto res_ptr = reinterpret_cast<std::uintptr_t>(residual_ptr);
-  auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight_ptr);
-  bool ptrs_are_aligned = inp_ptr % req_alignment_bytes == 0 &&
-                          res_ptr % req_alignment_bytes == 0 &&
-                          wt_ptr % req_alignment_bytes == 0;
-  bool offsets_are_multiple_of_vector_width =
-      hidden_size % vector_width == 0 && input_stride % vector_width == 0;
-  bool can_vec = ptrs_are_aligned && offsets_are_multiple_of_vector_width;
-
-  sycl::range<3> grid(1, 1, num_tokens);
-  auto& queue = vllm::xpu::vllmGetQueue();
-
-  if (can_vec) {
-    sycl::range<3> block(
-        1, 1, std::min(hidden_size / vector_width, max_block_size));
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-      cgh.parallel_for(
-          sycl::nd_range<3>(grid * block, block),
-          fused_add_rms_norm_kernel<sycl_t, vector_width>(
-              (sycl_t*)input_ptr,
-              (sycl_t*)residual_ptr,
-              input_stride,
-              (const sycl_t*)weight_ptr,
-              epsilon,
-              num_tokens,
-              hidden_size,
-              s_variance));
-    });
-  } else {
-    sycl::range<3> block(1, 1, std::min(hidden_size, max_block_size));
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-      cgh.parallel_for(
-          sycl::nd_range<3>(grid * block, block),
-          fused_add_rms_norm_kernel<sycl_t, 0>(
-              (sycl_t*)input_ptr,
-              (sycl_t*)residual_ptr,
-              input_stride,
-              (const sycl_t*)weight_ptr,
-              epsilon,
-              num_tokens,
-              hidden_size,
-              s_variance));
-    });
-  }
-}
-
-}  // namespace vllm
-
-void rms_norm(
-    torch::Tensor& out,
-    torch::Tensor& input,
-    torch::Tensor& weight,
-    double epsilon) {
-  using Fast = void(
-      at::Tensor, const at::Tensor&, const std::optional<at::Tensor>&, double);
-  static auto fast =
-      vllm::decode::optional_operator<Fast>("_xpu_C::rms_norm_small_m", "out");
-  if (fast && input.is_xpu() && input.scalar_type() == at::kHalf &&
-      input.dim() >= 2 && input.dim() <= 4 && input.size(0) >= 1 &&
-      input.size(0) <= 8 && input.stride(-1) == 1 && epsilon >= 0 &&
-      (input.size(-1) == 256 || input.size(-1) == 512 ||
-       input.size(-1) == 2816) &&
-      input.numel() / input.size(-1) >= 1 &&
-      input.numel() / input.size(-1) <= 128 &&
-      weight.device() == input.device() && weight.scalar_type() == at::kHalf &&
-      weight.dim() == 1 && weight.numel() == input.size(-1) &&
-      weight.is_contiguous() && out.device() == input.device() &&
-      out.scalar_type() == at::kHalf && out.sizes() == input.sizes() &&
-      out.is_contiguous() &&
-      (!out.is_alias_of(input) ||
-       at::get_overlap_status(out, input) == at::MemOverlapStatus::No) &&
-      (!out.is_alias_of(weight) ||
-       at::get_overlap_status(out, weight) == at::MemOverlapStatus::No)) {
-    fast->call(out, input, weight, epsilon);
-    return;
-  }
-  const at::DeviceGuard device_guard(input.device());
-  TORCH_CHECK(out.is_contiguous());
-  if (input.stride(-1) != 1) {
-    input = input.contiguous();
-  }
-  TORCH_CHECK(input.stride(-1) == 1);
-  TORCH_CHECK(weight.is_contiguous());
-  VLLM_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "call_rms_norm_kernel", [&] {
-        vllm::call_rms_norm_kernel<scalar_t>(out, input, weight, epsilon);
-      });
-}
-
-void fused_add_rms_norm(
-    torch::Tensor& input,
-    torch::Tensor& residual,
-    torch::Tensor& weight,
-    double epsilon) {
-  const at::DeviceGuard device_guard(input.device());
-  int hidden_size = input.size(-1);
-  int num_tokens = input.numel() / hidden_size;
-
-  VLLM_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "call_fused_add_rms_norm_kernel", [&] {
-        vllm::call_fused_add_rms_norm_kernel<scalar_t>(
-            input, residual, weight, epsilon);
-      });
-}
+}  // namespace vllm_weightless_rms
