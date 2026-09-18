@@ -191,6 +191,7 @@ class cmake_build_ext(build_ext):
             "BASIC_KERNELS_ENABLED",
             "FA2_KERNELS_ENABLED",
             "MOE_KERNELS_ENABLED",
+            "DECODE_KERNELS_ENABLED",
             "RMS_KERNELS_ENABLED",
             "FP16_LINEAR_KERNELS_ENABLED",
             "GDN_KERNELS_ENABLED",
@@ -585,6 +586,13 @@ if _build_custom_ops():
             and _is_enabled("BUILD_SYCL_TLA_KERNELS")
             and _is_enabled("VLLM_XPU_ENABLE_XE2")):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._fp16_C"))
+    if (_is_enabled("MOE_KERNELS_ENABLED")
+            and _is_enabled("BUILD_SYCL_TLA_KERNELS")
+            and _is_enabled("VLLM_XPU_ENABLE_XE2")):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._moe_decode_C"))
+    if _is_enabled("DECODE_KERNELS_ENABLED"):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._decode_aux_C"))
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._decode_C"))
     if (_is_enabled("LINEAR_TLA_KERNELS_ENABLED")
             and _is_enabled("BUILD_SYCL_TLA_KERNELS")
             and _is_enabled("VLLM_XPU_ENABLE_XE2")):

@@ -31,16 +31,9 @@
  **************************************************************************************************/
 
 #pragma once
-
-#include <cute/tensor.hpp>
-#include <cute/util/compat.hpp>
-#include <sycl/sycl.hpp>
-
-// Adapted from vllm-xpu-kernels v0.1.11.1 xe_gemm.
-// Direct physical [N,K] FP8 weights, FP32 split-K output, no bias/scale here.
-namespace vllm::linear_tla {
-using namespace cute;
-
+// Adapted from the frozen upstream xe_gemm: same dequantization/DPAS math,
+// shared A loads, gate/up register accumulators and a half-preserving epilogue.
+namespace MoE {
 template <
     class GmemTiledCopyA,
     class GmemTiledCopyB,
@@ -48,21 +41,23 @@ template <
     class ATensor,
     class BTensor,
     class DTensor,
-    class TiledMMA>
-CUTE_DEVICE void nt_split_mainloop(
+    class TiledMMA,
+    typename ElementS,
+    typename ElementBI>
+CUTE_DEVICE void xe_gemm_gate_up(
     ATensor const& A,  // (M,K)
     BTensor const& B,  // (N,K)
-    DTensor& C,        // (M,N)
+    const ElementS* Scales,
+    const ElementBI* Bias,
+    DTensor& C,  // (M,N)
     Coord<int, int, cute::Underscore, int> blk_coord,
-    TiledMMA const& mma,
-    int k_begin,
-    int k_end) {
+    TiledMMA const& mma) {
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_m = get<0>(blk_coord);
   auto wg_n = get<1>(blk_coord);
-  int local_id = item.get_local_linear_id() % int(size(mma));
+  int local_id = item.get_local_linear_id();
 
   Tensor cA = make_identity_tensor(A.shape());
   Tensor cB = make_identity_tensor(B.shape());
@@ -75,6 +70,10 @@ CUTE_DEVICE void nt_split_mainloop(
       cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(
       cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
+  Tensor gBU = local_tile(
+      cB,
+      select<1, 2>(wg_tile),
+      make_coord(wg_n + 352 / int(get<1>(wg_tile)), _));
   Tensor gC =
       local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});  // (BLK_M,BLK_N)
 
@@ -89,15 +88,19 @@ CUTE_DEVICE void nt_split_mainloop(
 
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
   auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+  auto tCrBU = thr_mma.partition_sg_fragment_B(gBU(_, _, 0));
 
   auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
   auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+  auto tBrBU = thr_copy_b.partition_sg_fragment_D(gBU(_, _, 0));
 
   Tensor tAgA = thr_copy_a.partition_S(gA);
   Tensor tBgB = thr_copy_b.partition_S(gB);
+  Tensor tBgBU = thr_copy_b.partition_S(gBU);
 
   /* Partition C */
   auto tCrC = thr_mma.partition_sg_fragment_C(gC);
+  auto tCrCU = thr_mma.partition_sg_fragment_C(gC);
   auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
   auto tCgC = thr_copy_c.partition_D(gC);
 
@@ -109,43 +112,71 @@ CUTE_DEVICE void nt_split_mainloop(
 
   auto pAgA = thr_prefetch_A.partition_S(gA);
   auto pBgB = thr_prefetch_B.partition_S(gB);
+  auto pBgBU = thr_prefetch_B.partition_S(gBU);
 
   const int prefetch_dist = 3;
 
   constexpr int barrier_scope = 2;
 
-  int k_tile_prefetch = k_begin;
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
 
   clear(tCrC);
+  clear(tCrCU);
+
+  using ElementB = typename BTensor::element_type;
+  static constexpr bool is_B_fp8_type =
+      std::is_same_v<ElementB, cutlass::float_e5m2_t> ||
+      std::is_same_v<ElementB, cutlass::float_e4m3_t>;
 
   CUTE_UNROLL
-  for (; k_tile_prefetch < k_begin + prefetch_dist && k_tile_prefetch < k_end;
-       k_tile_prefetch++) {
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
     prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b, pBgBU(_, _, _, k_tile_prefetch));
   }
 
-  for (int k_tile = k_begin; k_tile < k_end; k_tile++, k_tile_prefetch++) {
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
     barrier_arrive(barrier_scope);
 
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+    copy(copy_b, tBgBU(_, _, _, k_tile), tBrBU);
 
-    if (k_tile_prefetch < k_end) {
+    if (k_tile_prefetch < k_tile_count) {
       prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
       prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgBU(_, _, _, k_tile_prefetch));
     }
 
     reorder(tArA, tCrA);
     reorder(tBrB, tCrB);
+    reorder(tBrBU, tCrBU);
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
+    cute::gemm(mma, tCrA, tCrBU, tCrCU);
 
     barrier_wait(barrier_scope);
+  }
+
+  const float scale = Scales[0];
+  CUTE_UNROLL
+  for (int i = 0; i < tCrC.size(); ++i) {
+    // Preserve upstream FP16 GEMM1, GELU, and activation boundaries.
+    const float x = float(cutlass::half_t(tCrC(i) * scale));
+    const float up = float(cutlass::half_t(tCrCU(i) * scale));
+    const float inner = 0.7978845608028654f * (x + 0.044715f * (x * x * x));
+    float exponent = 2.0f * inner;
+    if (exponent > 30.f) exponent = 30.f;
+    if (exponent < -30.f) exponent = -30.f;
+    const float e = sycl::native::exp(exponent);
+    const float t = (e - 1.f) * sycl::native::recip(e + 1.f);
+    const float gelu = float(cutlass::half_t(0.5f * x * (1.f + t)));
+    tCrC(i) = float(cutlass::half_t(gelu * up));
   }
 
   reorder(tCrC, tCrC_out);
   copy(copy_c, tCrC_out, tCgC);
 }
 
-}  // namespace vllm::linear_tla
+}  // namespace MoE
