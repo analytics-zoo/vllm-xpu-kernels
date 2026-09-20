@@ -15,7 +15,7 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "collective/chunk_prefill_scheduler.hpp"
+#include "collective/reduce_splitk_scheduler.hpp"
 #include "collective/chunk_prefill_epilogue.hpp"
 #include "kernel/paged_decode_kernel.hpp"
 

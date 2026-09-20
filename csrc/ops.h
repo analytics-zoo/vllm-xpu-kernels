@@ -2,6 +2,13 @@
 
 #include <torch/all.h>
 
+void rms_norm_gated_decode(
+    torch::Tensor& out,
+    const torch::Tensor& input,
+    const torch::Tensor& gate,
+    const torch::Tensor& weight,
+    double epsilon);
+
 torch::Tensor weak_ref_tensor(torch::Tensor& tensor);
 
 void rms_norm(
