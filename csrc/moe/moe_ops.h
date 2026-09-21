@@ -2,6 +2,11 @@
 
 #include <torch/all.h>
 
+std::tuple<torch::Tensor, torch::Tensor> gemma4_small_m_topk(
+    const torch::Tensor& logits,
+    const std::optional<torch::Tensor>& per_expert_scale,
+    int64_t topk);
+
 void moe_sum(
     torch::Tensor& input,
     torch::Tensor& output,

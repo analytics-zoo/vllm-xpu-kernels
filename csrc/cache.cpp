@@ -1,4 +1,5 @@
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
 #include <iostream>
@@ -14,6 +15,40 @@
 constexpr float kFp8E4M3ScaleDivisor = 448.f;
 
 namespace vllm {
+
+template <typename Kernel>
+struct SmallDecodeCacheWriteLargeGrf {
+  Kernel kernel;
+
+  auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+    return sycl::ext::oneapi::experimental::properties{
+        sycl::ext::intel::experimental::grf_size<256>};
+  }
+
+  void operator()(sycl::nd_item<1> item) const { kernel(item); }
+};
+
+template <typename Kernel>
+void launch_strided_cache_write(
+    sycl::queue& queue,
+    sycl::range<1> grid,
+    sycl::range<1> block,
+    bool use_large_grf,
+    Kernel kernel) {
+  queue.submit([&](sycl::handler& cgh) {
+    if (use_large_grf) {
+      // Small D512 cache writes immediately precede large-GRF paged decode.
+      // The two-KV-head path benefits from keeping the same GRF mode:
+      // switching through a small-GRF writer can
+      // substantially increase the following attention kernel's device time.
+      cgh.parallel_for(
+          sycl::nd_range<1>(grid * block, block),
+          SmallDecodeCacheWriteLargeGrf<Kernel>{kernel});
+    } else {
+      cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
+    }
+  });
+}
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 class reshape_and_cache_kernel {
@@ -901,26 +936,29 @@ void reshape_and_cache(
       key.scalar_type(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE);
 }
 
-#define CALL_RESHAPE_AND_CACHE_FLASH_STRIDED(KV_T, CACHE_T, KV_DTYPE)          \
-  queue.submit([&](sycl::handler& cgh) {                                       \
-    cgh.parallel_for(                                                          \
-        sycl::nd_range<1>(grid * block, block),                                \
-        vllm::reshape_and_cache_flash_strided_kernel<KV_T, CACHE_T, KV_DTYPE>( \
-            reinterpret_cast<KV_T*>(key.data_ptr()),                           \
-            reinterpret_cast<KV_T*>(value.data_ptr()),                         \
-            reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                  \
-            slot_mapping.data_ptr<int64_t>(),                                  \
-            block_stride,                                                      \
-            page_stride,                                                       \
-            head_stride,                                                       \
-            key_stride,                                                        \
-            value_stride,                                                      \
-            num_heads,                                                         \
-            head_size,                                                         \
-            block_size,                                                        \
-            reinterpret_cast<const float*>(k_scale.data_ptr()),                \
-            reinterpret_cast<const float*>(v_scale.data_ptr())));              \
-  });
+#define CALL_RESHAPE_AND_CACHE_FLASH_STRIDED(KV_T, CACHE_T, KV_DTYPE)        \
+  vllm::launch_strided_cache_write(                                          \
+      queue,                                                                 \
+      grid,                                                                  \
+      block,                                                                 \
+      num_tokens > 0 && num_tokens <= 8 && head_size == 512 &&               \
+          num_heads == 2 && key.scalar_type() == at::kHalf &&                \
+          KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto,                       \
+      vllm::reshape_and_cache_flash_strided_kernel<KV_T, CACHE_T, KV_DTYPE>( \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                           \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                         \
+          reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                  \
+          slot_mapping.data_ptr<int64_t>(),                                  \
+          block_stride,                                                      \
+          page_stride,                                                       \
+          head_stride,                                                       \
+          key_stride,                                                        \
+          value_stride,                                                      \
+          num_heads,                                                         \
+          head_size,                                                         \
+          block_size,                                                        \
+          reinterpret_cast<const float*>(k_scale.data_ptr()),                \
+          reinterpret_cast<const float*>(v_scale.data_ptr())));
 
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.

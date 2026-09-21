@@ -70,10 +70,16 @@ option(FA2_KERNELS_ENABLED
        "Build Flash Attention 2 kernels (_vllm_fa2_C extension)" ON)
 option(MOE_KERNELS_ENABLED
        "Build MoE kernels (_moe_C extension + grouped_gemm TLA)" ON)
+option(DECODE_KERNELS_ENABLED
+       "Build decode fusion kernels (_decode_C extension)" ON)
+option(RMS_KERNELS_ENABLED "Build weightless RMSNorm (_rms_C extension)" ON)
+option(FP16_LINEAR_KERNELS_ENABLED "Build FP16 NT linear (_fp16_C extension)" ON)
 option(GDN_KERNELS_ENABLED "Build GDN attention kernels (gdn_attn TLA)" ON)
 option(MQA_LOGITS_KERNELS_ENABLED "Build MQA logits kernels" ON)
 option(MHC_KERNELS_ENABLED
        "Build MHC (Manifold-Constrained Hyper-Connections) kernels" ON)
+option(LINEAR_TLA_KERNELS_ENABLED
+       "Build small-M FP8 TLA linear (_linear_C extension)" ON)
 option(XPU_SPECIFIC_KERNELS_ENABLED
        "Build XPU-specific kernels (_xpu_C extension)" ON)
 option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
@@ -141,6 +147,7 @@ message(STATUS "  VLLM_XPU_ENABLE_XE_DEFAULT   = ${VLLM_XPU_ENABLE_XE_DEFAULT}")
 message(STATUS "  BASIC_KERNELS_ENABLED        = ${BASIC_KERNELS_ENABLED}")
 message(STATUS "  FA2_KERNELS_ENABLED          = ${FA2_KERNELS_ENABLED}")
 message(STATUS "  MOE_KERNELS_ENABLED          = ${MOE_KERNELS_ENABLED}")
+message(STATUS "  DECODE_KERNELS_ENABLED       = ${DECODE_KERNELS_ENABLED}")
 message(STATUS "  GDN_KERNELS_ENABLED          = ${GDN_KERNELS_ENABLED}")
 message(STATUS "  MQA_LOGITS_KERNELS_ENABLED   = ${MQA_LOGITS_KERNELS_ENABLED}")
 message(STATUS "  MHC_KERNELS_ENABLED          = ${MHC_KERNELS_ENABLED}")
@@ -614,6 +621,43 @@ endif()
 #
 # xpu only ops/kernels, implemented with cutlass/onednn/sycl.
 #
+# This optional TLA module targets BMG-G31; other architectures use native
+# linear through the guarded public op without submitting these device kernels.
+if(FP16_LINEAR_KERNELS_ENABLED AND BUILD_SYCL_TLA_KERNELS AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/fp16_linear/CMakeLists.txt)
+endif()
+
+if(RMS_KERNELS_ENABLED)
+  include(csrc/xpu/rms/CMakeLists.txt)
+endif()
+
+if(MOE_KERNELS_ENABLED AND BUILD_SYCL_TLA_KERNELS AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/moe_decode/CMakeLists.txt)
+endif()
+
+if(DECODE_KERNELS_ENABLED)
+  include(csrc/xpu/decode_aux/CMakeLists.txt)
+  define_gpu_extension_target(
+    _decode_C
+    DESTINATION vllm_xpu_kernels
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES
+      "csrc/xpu/decode/torch_bindings.cpp"
+      "csrc/xpu/gemma_norm_fusions.cpp"
+      "csrc/xpu/gemma_decode_fusions.cpp"
+    COMPILE_FLAGS ${VLLM_GPU_COMPILE_FLAGS}
+    LINK_FLAGS ${VLLM_GPU_LINK_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/csrc ${VLLM_XPU_INCLUDE_DIR}
+    USE_SABI 3
+    WITH_SOABI)
+endif()
+
+if(LINEAR_TLA_KERNELS_ENABLED AND BUILD_SYCL_TLA_KERNELS
+   AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/fp8_linear_tla/CMakeLists.txt)
+endif()
+
 if(XPU_SPECIFIC_KERNELS_ENABLED)
   message(STATUS "Enabling _xpu_C extension.")
 

@@ -3,6 +3,9 @@ import os
 from typing import Optional
 
 import torch
+from . import decode_aux
+
+_FP8_MOE_DECODE = getattr(torch.ops._xpu_C, "fp8_moe_decode", None)
 
 try:
     from . import _C  # noqa: F401
@@ -273,6 +276,20 @@ class XpuFusedMoe:
         expert_map=None,
         a1q_scale=None,
     ):
+        # This XPU experts boundary already owns remap, both GEMMs, activation
+        # and gather. The candidate keeps all three FP16 rounding boundaries.
+        if (_FP8_MOE_DECODE is not None and not self._use_ref and self.is_fp8
+                and self.activation == "gelu_tanh"
+                and self.w13_bias is None and self.w2_bias is None
+                and self.ep_size == 1 and self.ep_rank == 0
+                and self.expert_map is None and expert_map is None
+                and a1q_scale is None and self.gemm1_clamp_limit is None
+                and self.gemm1_wei_scales is not None
+                and self.gemm2_wei_scales is not None):
+            if _FP8_MOE_DECODE(output, hidden_states, self.w13,
+                               self.gemm1_wei_scales, self.w2,
+                               self.gemm2_wei_scales, topk_weights, topk_ids):
+                return
         if self._use_ref:
             self._apply_ref(output, hidden_states,
                             topk_weights, topk_ids,
@@ -326,6 +343,24 @@ class XpuFusedMoe:
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
+        use_small_m_aux = (
+            decode_aux._PREPARE is not None
+            and decode_aux._GATHER is not None
+            and not act_quant and expert_map is None
+            and self.ep_size == 1 and self.num_experts == 128
+            and self.total_experts_num == 128
+            and self.n_experts_per_token == 8
+            and 1 <= num_rows <= 8 and hidden_size == 2816
+            and hidden_states.dtype == torch.float16
+            and hidden_states.is_contiguous()
+            and hidden_states.storage_offset() % 8 == 0
+            and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+            and topk_weights.dtype == torch.float32
+            and topk_weights.is_contiguous()
+            and output.dtype == torch.float16 and output.is_contiguous()
+            and output.storage_offset() % 8 == 0
+        )
+
         if act_quant:
             remapped_scales = torch.empty(
                 (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
@@ -337,7 +372,7 @@ class XpuFusedMoe:
             (num_rows * self.n_experts_per_token, hidden_size),
             dtype=hidden_states.dtype,
             device=hidden_states.device)
-        rows_per_expert = torch.zeros((self.num_experts),
+        rows_per_expert = (torch.empty if use_small_m_aux else torch.zeros)((self.num_experts),
                                                 dtype=torch.int32,
                                                 device=hidden_states.device)
         unpermuted_row_to_permuted_row = torch.empty(
@@ -345,17 +380,22 @@ class XpuFusedMoe:
             dtype=torch.int32,
             device=hidden_states.device)
 
-        torch.ops._moe_C.remap_hidden_states(
-            hidden_states=hidden_states,
-            hidden_states_scales=a1q_scale,
-            remapped_hidden_states=remapped_hidden_states,
-            remapped_hidden_states_scales=remapped_scales,
-            expert_map=expert_map,
-            rows_per_expert=rows_per_expert,
-            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
-            topk_ids=topk_ids,
-            total_experts_num=self.total_experts_num,
-            local_experts_num=self.local_experts_num)
+        if use_small_m_aux:
+            decode_aux._PREPARE(remapped_hidden_states, rows_per_expert,
+                                unpermuted_row_to_permuted_row,
+                                hidden_states, topk_ids)
+        else:
+            torch.ops._moe_C.remap_hidden_states(
+                hidden_states=hidden_states,
+                hidden_states_scales=a1q_scale,
+                remapped_hidden_states=remapped_hidden_states,
+                remapped_hidden_states_scales=remapped_scales,
+                expert_map=expert_map,
+                rows_per_expert=rows_per_expert,
+                unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+                topk_ids=topk_ids,
+                total_experts_num=self.total_experts_num,
+                local_experts_num=self.local_experts_num)
 
         ########### gemm1 ##################
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
@@ -385,7 +425,9 @@ class XpuFusedMoe:
             (num_moe_inputs, self.inter_size * self.inter_size_scale),
             dtype=gemm1_output.dtype,
             device=gemm1_output.device)
-        self.act_func(act_output, gemm1_output)
+        if not (self.activation == "gelu_tanh"
+                and decode_aux.gelu_tanh_and_mul(act_output, gemm1_output)):
+            self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, hidden_size),
@@ -406,9 +448,14 @@ class XpuFusedMoe:
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts)
 
-        torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
-                                    unpermuted_row_to_permuted_row,
-                                    self.num_experts)
+        if use_small_m_aux:
+            decode_aux._GATHER(output, gemm2_output, topk_weights,
+                               unpermuted_row_to_permuted_row)
+        else:
+            torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                        unpermuted_row_to_permuted_row,
+                                        self.num_experts)
+
 
 def xpu_fused_moe(hidden_states,
                   w13,

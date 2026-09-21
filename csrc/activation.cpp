@@ -4,6 +4,8 @@
 #include <numeric>
 #include "utils.h"
 #include "dispatch_utils.h"
+#include <ATen/MemoryOverlap.h>
+#include "xpu/decode/legacy_dispatch.h"
 
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Float8_e5m2.h>
@@ -71,6 +73,23 @@ inline T gelu_tanh_kernel(const T& x) {
   float inner = BETA * (f + KAPPA * x_cube);
   return (T)(0.5f * f * (1.0f + sycl::tanh(inner)));
 }
+
+// A work-group per token leaves small decode batches on only a few cores.
+// Split each 4096-wide row into 128-element tiles instead. Keep the same
+// FP32 activation and FP16 rounding before multiplication as the generic op.
+struct gelu_tanh_mul_small_batch_kernel {
+  const sycl::half* input;
+  sycl::half* output;
+
+  void operator()
+      [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> item) const {
+    const int index = item.get_global_id(0);
+    const int row = index / 4096;
+    const int col = index % 4096;
+    output[index] = gelu_tanh_kernel(input[row * 8192 + col]) *
+                    input[row * 8192 + 4096 + col];
+  }
+};
 
 template <typename T>
 inline T fatrelu_kernel(const T& x, const float threshold) {
@@ -587,6 +606,37 @@ void gelu_tanh_and_mul(
     torch::Tensor& out,    // [..., d]
     torch::Tensor& input)  // [..., 2 * d]
 {
+  if (input.is_xpu() && input.scalar_type() == at::kHalf && input.dim() == 2 &&
+      input.size(0) >= 1 && input.size(0) <= 8 && input.size(1) == 8192 &&
+      input.is_contiguous() && out.device() == input.device() &&
+      out.scalar_type() == at::kHalf && out.dim() == 2 &&
+      out.size(0) == input.size(0) && out.size(1) == 4096 &&
+      out.is_contiguous() &&
+      at::get_overlap_status(out, input) == at::MemOverlapStatus::No) {
+    const at::DeviceGuard device_guard(input.device());
+    auto& queue = vllm::xpu::vllmGetQueue();
+    queue.parallel_for(
+        sycl::nd_range<1>(input.size(0) * 4096, 128),
+        vllm::gelu_tanh_mul_small_batch_kernel{
+            reinterpret_cast<const sycl::half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>())});
+    return;
+  }
+  using Fast = void(at::Tensor, const at::Tensor&);
+  static auto fast = vllm::decode::optional_operator<Fast>(
+      "_xpu_C::gelu_tanh_and_mul_small_m");
+  if (fast && input.is_xpu() && input.scalar_type() == at::kHalf &&
+      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 64 &&
+      (input.size(1) == 704 || input.size(1) == 2112) &&
+      input.is_contiguous() && out.device() == input.device() &&
+      out.scalar_type() == at::kHalf && out.dim() == 2 &&
+      out.size(0) == input.size(0) && out.size(1) * 2 == input.size(1) &&
+      out.is_contiguous() && uintptr_t(input.data_ptr()) % 8 == 0 &&
+      uintptr_t(out.data_ptr()) % 8 == 0 &&
+      at::get_overlap_status(out, input) == at::MemOverlapStatus::No) {
+    fast->call(out, input);
+    return;
+  }
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL_VEC(vllm::gelu_tanh_kernel, true);
   });

@@ -120,3 +120,47 @@ def test_rms_norm_uncontigous(
         torch.ops._C.rms_norm,
         (out, q_by_head, layer.weight.data, layer.variance_epsilon),
     )
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("width", [256, 512, 2816])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("offset", [0, 1])
+@torch.inference_mode()
+def test_small_m_rms_strided_current_stream(batch, width, weighted, offset):
+    """Decode norm must preserve FP16 rounding and sliced QKV row strides."""
+    if not hasattr(torch.ops._xpu_C, "rms_norm_small_m"):
+        pytest.skip("Optional RMS extension was not built")
+    generator = torch.Generator(device="cpu").manual_seed(19)
+    cpu = torch.randn(batch, 2, width * 2 + 1,
+                      generator=generator, device="cpu").half()
+    view = cpu[..., offset:offset + width]
+    weight = torch.randn(width, generator=generator,
+                         device="cpu").half() if weighted else None
+    f = view.float()
+    expected = (f * torch.rsqrt(f.square().mean(-1, keepdim=True)
+                               + 1e-6)).half()
+    if weight is not None:
+        expected = (expected * weight).half()
+    stream = torch.xpu.Stream()
+    with torch.xpu.stream(stream):
+        x = cpu.to("xpu")[..., offset:offset + width]
+        w = weight.to("xpu") if weight is not None else None
+        actual = torch.ops._xpu_C.rms_norm_small_m(x, w, 1e-6)
+        output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+        torch.ops._xpu_C.rms_norm_small_m.out(output, x, w, 1e-6)
+    stream.synchronize()
+    torch.testing.assert_close(actual.cpu(), expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-3)
+    assert actual.is_contiguous()
+
+
+@torch.inference_mode()
+def test_small_m_rms_rejects_alias_before_submission():
+    """The out overload is functional with respect to input and weight."""
+    if not hasattr(torch.ops._xpu_C, "rms_norm_small_m"):
+        pytest.skip("Optional RMS extension was not built")
+    x = torch.ones((1, 2816), device="xpu", dtype=torch.float16)
+    with pytest.raises(RuntimeError):
+        torch.ops._xpu_C.rms_norm_small_m.out(x, x, None, 1e-6)
+    torch.testing.assert_close(x, torch.ones_like(x))

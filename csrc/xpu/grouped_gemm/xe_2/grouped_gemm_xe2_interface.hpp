@@ -56,6 +56,7 @@
 
 #include "gemm_xe2_policy.hpp"
 #include "grouped_gemm_xe2.hpp"
+#include "compact_moe_tile_map.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -222,6 +223,24 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(ptr_bias->size(1) == N, "ptr_bias.size(1) must match N");
   }
 
+  if (gemma_compact_eligible(
+          ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, rows_per_expert,
+          N, K, num_experts)) {
+    // Keep V1's m8 arithmetic policy: this experiment changes scheduling only.
+    at::Tensor tile_map = at::empty(
+        {1 + 4 * static_cast<int64_t>(A_total_M)},
+        ptr_A.options().dtype(at::kInt));
+    launch_gemma_compact_gemm<w8a16_policy_m_8>(
+        dpcpp_queue,
+        reinterpret_cast<const cutlass::half_t*>(ptr_A.data_ptr()),
+        reinterpret_cast<const cutlass::float_e4m3_t*>(ptr_B.data_ptr()),
+        ptr_scales->data_ptr<float>(),
+        reinterpret_cast<cutlass::half_t*>(ptr_D.data_ptr()),
+        rows_per_expert.data_ptr<int>(), A_total_M, N, K,
+        tile_map.data_ptr<int32_t>());
+    return ptr_D;
+  }
+
   at::Tensor atomic_buffer =
       at::empty({static_cast<long>(1)}, ptr_A.options().dtype(at::kInt));
 
@@ -325,7 +344,7 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   }
 
     if (A_avg_M <= 8) {
-      using policy = w8a16_policy_m_16;
+      using policy = w8a16_policy_m_8;
       W8A16LauncherCallER(policy);
     } else if (A_avg_M <= 32) {
       using policy = w8a16_policy_m_32;

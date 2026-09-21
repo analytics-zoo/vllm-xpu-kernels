@@ -1,6 +1,7 @@
 #include <sycl/sycl.hpp>
 #include "utils.h"
 #include "dispatch_utils.h"
+#include "xpu/decode/legacy_dispatch.h"
 #include <cmath>
 #include <c10/macros/Macros.h>
 
@@ -279,6 +280,14 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox) {
+  using Fast = bool(
+      const at::Tensor&, at::Tensor, at::Tensor, int64_t, const at::Tensor&);
+  static auto fast = vllm::decode::optional_operator<Fast>(
+      "_xpu_C::try_rotary_embedding_small_m");
+  if (fast && is_neox && key.has_value() &&
+      fast->call(positions, query, *key, head_size, cos_sin_cache)) {
+    return;
+  }
   VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
     call_rotary_embedding_kernel<scalar_t>(
         positions, query, key, head_size, cos_sin_cache, is_neox);

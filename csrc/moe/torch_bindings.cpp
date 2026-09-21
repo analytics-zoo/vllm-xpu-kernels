@@ -2,6 +2,11 @@
 #include "moe_ops.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
+  m.def(
+      "gemma4_small_m_topk(Tensor logits, Tensor? per_expert_scale, "
+      "int topk) -> (Tensor, Tensor)");
+  m.impl("gemma4_small_m_topk", torch::kXPU, &gemma4_small_m_topk);
+
   // Calculate the result of moe by summing up the partial results
   // from all selected experts.
   m.def(
