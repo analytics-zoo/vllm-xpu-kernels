@@ -12,6 +12,7 @@ from shutil import which
 
 from packaging.version import Version
 from setuptools import Extension, setup
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_ext import build_ext
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import SYCL_HOME
@@ -84,8 +85,32 @@ def _is_enabled(env_name: str, default: str = "ON") -> bool:
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=True, **kwa)
+        kwa.setdefault("py_limited_api", True)
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
+
+
+class qwen38_bdist_wheel(bdist_wheel):
+
+    def finalize_options(self):
+        super().finalize_options()
+        # Direct Tensor pybind uses CPython/Torch ABI, including when the SO
+        # comes from a precompiled wheel rather than a declared extension.
+        extensions = self.distribution.ext_modules or ()
+        package_files = (
+            filename
+            for filenames in (self.distribution.package_data or {}).values()
+            for filename in filenames
+        )
+        has_qwen38 = any(
+            ext.name == "vllm_xpu_kernels._qwen38_C" for ext in extensions
+        ) or any(
+            Path(filename).name.startswith("_qwen38_C.")
+            and filename.endswith(".so") for filename in package_files
+        )
+        if has_qwen38:
+            self.py_limited_api = False
+            self.root_is_pure = False
 
 
 class cmake_build_ext(build_ext):
@@ -193,9 +218,11 @@ class cmake_build_ext(build_ext):
             "MOE_KERNELS_ENABLED",
             "GDN_KERNELS_ENABLED",
             "MQA_LOGITS_KERNELS_ENABLED",
+            "MHC_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
             "VLLM_XPU_ENABLE_ONEDNN",
+            "QWEN38_KERNELS_ENABLED",
         ]
         for opt in _kernel_options:
             cmake_args.append('-D{}={}'.format(
@@ -582,6 +609,9 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
             "/csrc/xpu/grouped_gemm/xe_default")
 
 if _build_custom_ops():
+    if _is_enabled("QWEN38_KERNELS_ENABLED"):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._qwen38_C",
+                                         py_limited_api=False))
     if _is_enabled("BASIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))
     if _is_enabled("FA2_KERNELS_ENABLED"):
@@ -594,11 +624,11 @@ if _build_custom_ops():
         ext_modules.append(
             CMakeExtension(name="vllm_xpu_kernels.xpumem_allocator"))
 
+cmdclass = {"bdist_wheel": qwen38_bdist_wheel}
 if ext_modules:
-    cmdclass = {
-        "build_ext":
+    cmdclass["build_ext"] = (
         precompiled_build_ext if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
-    }
+    )
 
 setup(
     version=get_vllm_version(),

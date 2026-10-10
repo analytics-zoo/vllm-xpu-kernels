@@ -151,6 +151,7 @@ uv pip install \
     build
 
 echo ">>> Building wheel..."
+# setup.py retains this legacy ABI request only without _qwen38_C.
 python setup.py bdist_wheel --dist-dir /workspace/dist --py-limited-api=cp38
 
 echo ">>> Wheel build complete."
