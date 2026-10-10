@@ -85,6 +85,23 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t N,
     int64_t K,
     int64_t num_experts);
+
+void moe_shared_fused_decode_interface(
+    torch::Tensor& output,
+    const torch::Tensor& x,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& w13,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2,
+    const torch::Tensor& w2_scale,
+    const torch::Tensor& shared_w13,
+    const torch::Tensor& shared_w13_scale,
+    const torch::Tensor& shared_w2,
+    const torch::Tensor& shared_w2_scale,
+    const torch::Tensor& shared_gate,
+    torch::Tensor& ws,
+    int64_t tile_m);
 #endif
 
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
@@ -408,3 +425,32 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> compact_sampling_mask(
     const torch::Tensor& num_sampled_tokens,
     int64_t max_num_kept,
     int64_t max_compact_support);
+
+void qkv_split_norm_rope(
+    const torch::Tensor& qkv,
+    const torch::Tensor& positions,
+    const torch::Tensor& q_weight,
+    const torch::Tensor& k_weight,
+    const torch::Tensor& cos_sin_cache,
+    torch::Tensor& q_out,
+    torch::Tensor& k_out,
+    const std::optional<torch::Tensor>& gate_out,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t rotary_dim,
+    double eps,
+    double weight_offset,
+    std::vector<int64_t> mrope_section,
+    bool mrope_interleaved);
+
+// One-shot P2P all-reduce (TP=2) over Level Zero IPC; see
+// csrc/xpu/custom_ar/custom_ar.cpp and vllm_xpu_kernels/custom_all_reduce.py.
+int64_t custom_ar_create(int64_t max_bytes);
+std::vector<int64_t> custom_ar_export(int64_t h);
+int64_t custom_ar_open(
+    int64_t h, int64_t rank, std::vector<int64_t> peer, int64_t mode_mask);
+void custom_ar_all_reduce_(at::Tensor& x, int64_t h);
+int64_t custom_ar_error(int64_t h);
+void custom_ar_destroy(int64_t h);
+int64_t custom_ar_max_bytes_limit();
