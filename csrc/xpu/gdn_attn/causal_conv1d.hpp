@@ -485,17 +485,16 @@ struct update_states_kernel {
 // Grid: (num_spec_decodes, groups_per_token). Each thread owns a feature
 // chunk of `elems_per_item` lanes and walks all num_spec_tokens tokens of
 // one sequence in a sliding window:
-//   - q/k/v lanes: load Width-1 prior values from
-//     conv_states[cache_indices[batch, num_accepted_tokens[batch] - 1]],
+//   - q/k/v lanes: load Width-1 prior values from the first packed cache
+//     block at offset num_accepted_tokens[batch]-1 (or from a selected
+//     checkpoint block for compact standalone caches),
 //     then for every t_local in [0, num_spec_tokens) shift the window left
 //     by one, load the new input from mixed_qkvz[token_indx[...]], apply the
 //     conv (+bias +activation) and store to local q/k/v outputs.
 //   - z lanes: pure reorder, no conv.
 //   - b/a lanes: pure reorder.
-// After processing all tokens we write the trailing Width-1 input values to
-// ONLY the last cache slot: conv_states[cache_indices[batch, num_spec]],
-// matching the Triton fused_recurrent path which keeps a single rollback
-// reference for the next forward.
+// Packed caches retain Width-2 carried history rows and the speculative raw
+// inputs in the first block; compact caches checkpoint each token separately.
 // -----------------------------------------------------------------------------
 template <typename T, int Width, bool ReorderInput>
 struct causal_conv1d_spec_kernel {
@@ -518,6 +517,7 @@ struct causal_conv1d_spec_kernel {
       const T* conv_bias,
       T* conv_states,
       const int conv_states_stride_0,
+      const int conv_state_len,
       const int* query_start_loc,
       const int* token_indx,
       const int* cache_indices,
@@ -545,6 +545,7 @@ struct causal_conv1d_spec_kernel {
         conv_bias(conv_bias),
         conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        conv_state_len(conv_state_len),
         query_start_loc(query_start_loc),
         token_indx(token_indx),
         cache_indices(cache_indices),
@@ -689,14 +690,15 @@ struct causal_conv1d_spec_kernel {
     }
 
     // -- conv1d on q/k/v lanes ----------------------------------------------
-    // Pick the initial conv-state slot using num_accepted_tokens. The slot
-    // at column num_accepted_tokens[batch_id] - 1 was written by the previous
-    // step's last accepted token; we fall back to col 0 defensively when
-    // num_accepted_tokens == 0.
+    // vLLM packs convolution history and speculative inputs in the first
+    // block. Acceptance selects an offset within that block, unlike SSM
+    // checkpoints which select a block. Preserve compact standalone caches
+    // (Width-1 rows) using the per-token checkpoint layout.
+    const bool packed_state = conv_state_len > Width - 1;
     int init_col = num_accepted_tokens[batch_id] - 1;
     if (init_col < 0) init_col = 0;
-    const int init_state_id =
-        cache_indices[batch_id * cache_indices_stride_0 + init_col];
+    const int init_state_id = cache_indices
+        [batch_id * cache_indices_stride_0 + (packed_state ? 0 : init_col)];
 
     // Load weights
     T local_weights[Width * elems_per_item];
@@ -718,8 +720,9 @@ struct causal_conv1d_spec_kernel {
       local_input[i] = static_cast<T>(0);
     }
     if (Width > 1 && init_state_id != pad_slot_id) {
-      const T* init_state_ptr =
-          conv_states + init_state_id * conv_states_stride_0;
+      const T* init_state_ptr = conv_states +
+                                init_state_id * conv_states_stride_0 +
+                                (packed_state ? init_col * conv_elems : 0);
 #pragma unroll
       for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
@@ -731,7 +734,8 @@ struct causal_conv1d_spec_kernel {
     }
 
     for (int token_id_local = token_start, t_local = 0;
-         token_id_local < token_end; ++token_id_local, ++t_local) {
+         token_id_local < token_end;
+         ++token_id_local, ++t_local) {
       const int global_t = token_indx[token_id_local];
 
       // Shift window left by 1 (for t_local == 0 the trailing slot is fresh).
@@ -806,23 +810,40 @@ struct causal_conv1d_spec_kernel {
         }
       }
 
-      // Checkpoint the rolling conv state at every step into the cache slot
-      // that the next decoding round will read when `num_accepted_tokens ==
-      // t_local + 1`. Writing each column (not only the last one) keeps the
-      // scheduler's per-acceptance rollback consistent: column `t_local`
-      // holds the conv state right after consuming spec token `t_local`.
+      // Packed writeback contains Width-2 carried history rows followed by
+      // the raw speculative inputs. Other checkpoint blocks belong to SSM
+      // and must not be modified by the convolution kernel.
       if (Width > 1) {
-        const int save_state_id =
-            cache_indices[batch_id * cache_indices_stride_0 + t_local];
+        const int save_state_id = cache_indices
+            [batch_id * cache_indices_stride_0 + (packed_state ? 0 : t_local)];
         if (save_state_id != pad_slot_id) {
           T* save_state_ptr =
               conv_states + save_state_id * conv_states_stride_0;
+          if (packed_state) {
+            if (t_local == 0) {
 #pragma unroll
-          for (int i = 0; i < Width - 1; ++i) {
+              for (int i = 0; i < Width - 2; ++i) {
+#pragma unroll
+                for (int e = 0; e < elems_per_item; ++e) {
+                  save_state_ptr[i * conv_elems + reordered_elems_id + e] =
+                      local_input[Width * e + i + 1];
+                }
+              }
+            }
 #pragma unroll
             for (int e = 0; e < elems_per_item; ++e) {
-              save_state_ptr[i * conv_elems + reordered_elems_id + e] =
-                  local_input[Width * e + i + 1];
+              save_state_ptr
+                  [(Width - 2 + t_local) * conv_elems + reordered_elems_id +
+                   e] = local_input[Width * e + Width - 1];
+            }
+          } else {
+#pragma unroll
+            for (int i = 0; i < Width - 1; ++i) {
+#pragma unroll
+              for (int e = 0; e < elems_per_item; ++e) {
+                save_state_ptr[i * conv_elems + reordered_elems_id + e] =
+                    local_input[Width * e + i + 1];
+              }
             }
           }
         }
@@ -843,6 +864,7 @@ struct causal_conv1d_spec_kernel {
   const T* conv_bias;
   T* conv_states;
   const int conv_states_stride_0;
+  const int conv_state_len;
   const int* query_start_loc;
   const int* token_indx;
   const int* cache_indices;
@@ -896,7 +918,8 @@ void kernel_launcher(
     const int& num_prefills,
     const int& num_decodes,
     const int& num_spec_decodes,
-    const int& num_spec_tokens) {
+    const int& num_spec_tokens,
+    const int conv_state_len) {
   // Spec path: state writeback happens inside the spec kernel, so we do not
   // run the auxiliary update_states_kernel for prefills here.
   if (num_accepted_tokens != nullptr) {
@@ -918,6 +941,7 @@ void kernel_launcher(
           conv_bias,
           conv_states,
           conv_states_stride_0,
+          conv_state_len,
           query_start_loc,
           token_indx,
           cache_indices,
@@ -1052,6 +1076,11 @@ void causal_conv1d(
     TORCH_CHECK(cache_indices->dim() == 2);
     TORCH_CHECK(cache_indices->size(0) == num_spec_decodes);
     num_spec_tokens = cache_indices->size(1);
+    TORCH_CHECK(
+        conv_states.size(1) == width - 1 ||
+            conv_states.size(1) >= width - 2 + num_spec_tokens,
+        "Speculative convolution cache needs width-1 checkpoint rows or "
+        "width-2+num_spec_tokens packed rows");
     cache_indices_stride_0 = cache_indices->stride(0);
     TORCH_CHECK(num_accepted_tokens->size(0) == num_spec_decodes);
   }
@@ -1105,7 +1134,8 @@ void causal_conv1d(
       num_prefills,                                                           \
       num_decodes,                                                            \
       num_spec_decodes,                                                       \
-      num_spec_tokens);
+      num_spec_tokens,                                                        \
+      conv_states.size(1));
 
 #define WIDTH_DISPATCH(scalar_t, width, reorder_input) \
   switch (width) {                                     \
