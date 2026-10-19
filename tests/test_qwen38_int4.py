@@ -92,7 +92,8 @@ def test_quantization_matches_independent_pack_and_signed_scale(
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 7, 8, 17, 64])
 @pytest.mark.parametrize("n,k", [(12, 2560), (24, 2560), (17, 384),
-                                 (128, 2048), (256, 2560)])
+                                 (128, 2048), (256, 2560),
+                                 (640, 2560), (2048, 2560), (2560, 768)])
 def test_projection_matches_fp32_with_tail_tokens_and_rows(ops, m, n, k):
     torch.manual_seed(51)
     x = torch.randn(m, k, dtype=torch.float16, device="xpu")
@@ -104,6 +105,32 @@ def test_projection_matches_fp32_with_tail_tokens_and_rows(ops, m, n, k):
                                projection_reference(x, weight, scale),
                                rtol=1e-3,
                                atol=2e-3)
+
+
+@pytest.mark.parametrize("offsets", [(0, 0, 0), (1, 0, 0),
+                                      (0, 1, 0), (0, 0, 1)])
+def test_tp8_attention_output_graph_and_storage_offsets(ops, offsets):
+    torch.manual_seed(103)
+    x_offset, w_offset, s_offset = offsets
+    x = (torch.randn(768 + x_offset, device="xpu") * .2).half()
+    x = x[x_offset:].view(1, 768)
+    weight = torch.randint(256, (2560 * 384 + w_offset,), dtype=torch.uint8,
+                            device="xpu")[w_offset:].view(2560, 384)
+    scale = (torch.randn(2560 * 6 + s_offset, device="xpu") * .02).half()
+    scale = scale[s_offset:].view(2560, 6)
+    output = torch.empty(2561, dtype=torch.float16, device="xpu")[1:]
+    output = output.view(1, 2560)
+    ops.int4_linear(x, weight, scale, output)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        ops.int4_linear(x, weight, scale, output)
+    for value in (.125, -.25, 0.):
+        x.fill_(value)
+        scale.mul_(-1)
+        graph.replay()
+        torch.testing.assert_close(output.cpu(),
+                                   projection_reference(x, weight, scale),
+                                   atol=.002, rtol=.001)
 
 
 def test_contiguous_storage_offsets_do_not_require_vector_alignment(ops):

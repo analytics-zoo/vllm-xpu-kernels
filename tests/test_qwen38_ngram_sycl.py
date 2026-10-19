@@ -261,3 +261,51 @@ def test_cross_stream_retains_device_and_pinned_allocations(ops):
         out.cpu().view(torch.int16), expected, rtol=0, atol=0
     )
     del pressure
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "weight_offset,output_offset", [(0, 0), (1, 0), (0, 1), (1, 1)]
+)
+def test_lookup_graph_reads_live_host_bits_with_offset_views(
+    ops, dtype, weight_offset, output_offset
+):
+    # Packed loads must retain raw NaN/signed-zero bits; two-byte-aligned
+    # contiguous views must keep working through the scalar fallback.
+    backing = torch.empty(
+        16 * 160 + weight_offset, dtype=dtype, pin_memory=True
+    )
+    weight = backing[weight_offset:].reshape(16, 160)
+    bits = weight.view(torch.int16)
+    bits.copy_(torch.arange(16 * 160, dtype=torch.int16).reshape(16, 160))
+    raw_patterns = torch.tensor(
+        [0, -32768, 31745, -1, 1, 31744], dtype=torch.int16
+    )
+    bits[:, :6].copy_(raw_patterns)
+    ids_cpu = torch.arange(16, dtype=torch.int64).reshape(1, 16)
+    ids = ids_cpu.to("xpu")
+    storage = torch.full(
+        (2560 + output_offset + 1,), 123, dtype=dtype, device="xpu"
+    )
+    out = storage[output_offset:output_offset + 2560].reshape(1, 2560)
+    ops.ngram_host_lookup(weight, ids, out, 0, 16)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        ops.ngram_host_lookup(weight, ids, out, 0, 16)
+    for shift in (0, 1, -2):
+        # CPU changes occur after the previous replay completed. Replaying
+        # must dereference current host rows and current device IDs.
+        bits[:, 6:].add_(13)
+        changed = ids_cpu + shift
+        ids.copy_(changed)
+        graph.replay()
+        actual = out.cpu().view(torch.int16).reshape(16, 160)
+        expected = torch.zeros(16, 160, dtype=torch.int16)
+        for row, value in enumerate(changed.flatten().tolist()):
+            if 0 <= value < 16:
+                expected[row].copy_(bits[value])
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert storage[-1].item() == 123
+        if output_offset:
+            assert storage[0].item() == 123

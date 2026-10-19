@@ -14,6 +14,7 @@
 #include <initializer_list>
 #include <limits>
 #include <string_view>
+#include <type_traits>
 
 #include "qwen38/gdn_sycl.h"
 #include "qwen38/ops.h"
@@ -21,13 +22,11 @@
 namespace vllm::qwen38 {
 namespace {
 using half = sycl::half;
-constexpr int kHeads = 12;
 constexpr int kHeadSize = 128;
-constexpr int kWidth = kHeads * kHeadSize;
 constexpr int kSubgroup = 16;
 constexpr int kOutputRowsPerGroup = 32;
 static_assert(kHeadSize / 2 == kSubgroup * sizeof(uint32_t));
-template <int RowsPerGroup>
+template <int Heads, int RowsPerGroup, int WorkGroup>
 class GdnNormInt4FusedKernel;
 
 void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
@@ -43,7 +42,7 @@ void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
 }
 
 // The final ESIMD path retains FP32 normalized values in work-group storage.
-template <int RowsPerGroup>
+template <int Heads, int RowsPerGroup, int WorkGroup = 256>
 void launch_fused(
     sycl::queue& queue,
     const half* x,
@@ -55,14 +54,18 @@ void launch_fused(
     float eps) {
   static_assert(RowsPerGroup == 16 || RowsPerGroup == kOutputRowsPerGroup);
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> normalized(kWidth, cgh);
-    cgh.parallel_for<GdnNormInt4FusedKernel<RowsPerGroup>>(
-        sycl::nd_range<1>(2560 / RowsPerGroup * 256, 256),
+    constexpr int kWidth = Heads * kHeadSize;
+    // TP8 historically projects the materialized FP16 norm. TP4 retains
+    // FP32 norm in the fused path. Preserve each boundary when fusing.
+    using Norm = std::conditional_t<Heads == 6, half, float>;
+    sycl::local_accessor<Norm, 1> normalized(kWidth, cgh);
+    cgh.parallel_for<GdnNormInt4FusedKernel<Heads, RowsPerGroup, WorkGroup>>(
+        sycl::nd_range<1>(2560 / RowsPerGroup * WorkGroup, WorkGroup),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSubgroup)]] {
           const auto sg = item.get_sub_group();
           const int lane = sg.get_local_linear_id();
           const int worker = item.get_local_linear_id() / kSubgroup;
-          if (worker < kHeads) {
+          if (worker < Heads) {
             float xv[8], zv[8], sq[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -92,22 +95,24 @@ void launch_fused(
           item.barrier(sycl::access::fence_space::local_space);
 
 #pragma unroll
-          for (int row_index = 0; row_index < RowsPerGroup / 16; ++row_index) {
+          for (int row_index = 0;
+               row_index < RowsPerGroup / (WorkGroup / kSubgroup);
+               ++row_index) {
             // 每个输出保留原有累加/归约顺序，只复用本WG的FP32 norm。
             const int row = item.get_group_linear_id() * RowsPerGroup +
-                            row_index * 16 + worker;
+                            row_index * (WorkGroup / kSubgroup) + worker;
             // Four pairwise accumulators per lane represent the 64 ESIMD
             // even/odd pairs; each position accumulates across all 12 heads.
             float acc[4] = {};
             const int64_t row_byte = int64_t(row) * (kWidth / 2);
-            const int64_t row_scale = int64_t(row) * kHeads;
+            const int64_t row_scale = int64_t(row) * Heads;
             namespace sx = sycl::ext::oneapi::experimental;
             constexpr auto props = sx::properties{
                 sx::data_placement_striped,
                 sx::contiguous_memory,
                 sx::full_group,
                 sx::alignment<4>};
-            for (int head = 0; head < kHeads; ++head) {
+            for (int head = 0; head < Heads; ++head) {
               // 64 packed bytes/head: one consecutive uint32 per SG16 lane.
               sycl::vec<uint32_t, 1> raw;
               auto* words = sycl::address_space_cast<
@@ -126,7 +131,8 @@ void launch_fused(
                 const uint8_t packed = uint8_t(packed_word >> (8 * j));
                 const float lo = float(packed & 15) * s + neg8s;
                 const float hi = float(packed >> 4) * s + neg8s;
-                acc[j] += normalized[col] * lo + normalized[col + 1] * hi;
+                acc[j] += float(normalized[col]) * lo +
+                          float(normalized[col + 1]) * hi;
               }
             }
         // 64->32->16->8->4->2->1 pairwise reduction.
@@ -212,16 +218,19 @@ void gdn_norm_int4_sycl(
       reinterpret_cast<uintptr_t>(int4_weight.data_ptr()) |
       reinterpret_cast<uintptr_t>(int4_scale.data_ptr()) |
       reinterpret_cast<uintptr_t>(output.data_ptr());
-  if (hv == kHeads && sigmoid_gate && int4_weight.size(0) == 2560 &&
-      (alignment & 3U) == 0) {
+  if (sigmoid_gate && int4_weight.size(0) == 2560 && (alignment & 3U) == 0) {
     // Record before submit for dropped inputs on a non-default stream.
     for (const auto* t : std::initializer_list<const torch::Tensor*>{
              &x, &z, &norm_weight, &int4_weight, &int4_scale, &output})
       c10::xpu::XPUCachingAllocator::recordStream(
           t->storage().data_ptr(), stream);
     const char* tile_env = std::getenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE");
-    const std::string_view tile = tile_env == nullptr ? "32" : tile_env;
-    const auto launch = tile == "32" ? launch_fused<32> : launch_fused<16>;
+    const std::string_view tile =
+        tile_env == nullptr ? (hv == 6 ? "16" : "32") : tile_env;
+    const auto launch =
+        hv == 6
+            ? (tile == "32" ? launch_fused<6, 32> : launch_fused<6, 16, 128>)
+            : (tile == "32" ? launch_fused<12, 32> : launch_fused<12, 16>);
     launch(
         queue,
         reinterpret_cast<const half*>(x.data_ptr<at::Half>()),

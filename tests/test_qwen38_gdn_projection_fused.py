@@ -126,7 +126,7 @@ def test_tp4_default_output_tile_hit(native_op, monkeypatch):
         activities=[torch.profiler.ProfilerActivity.XPU]
     ) as prof:
         native_op(*case, output, 12, 128, EPS, True)
-    assert any("GdnNormInt4FusedKernel<32>" in event.name
+    assert any("GdnNormInt4FusedKernel<12, 32, 256>" in event.name
                for event in prof.events())
 
 
@@ -134,6 +134,17 @@ def test_tp4_fused_independent_golden(native_op):
     case = _case()
     actual = _call(native_op, case)
     torch.testing.assert_close(actual, _golden(*case), atol=0.025, rtol=0.002)
+
+
+@pytest.mark.parametrize("tile", ["16", "32"])
+def test_tp8_fused_keeps_materialized_half_norm(native_op, monkeypatch, tile):
+    monkeypatch.setenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", tile)
+    case = _case(hv=6)
+    tensors = [t.to("xpu") for t in case]
+    output = torch.empty(1, 2560, dtype=torch.half, device="xpu")
+    native_op(*tensors, output, 6, 128, EPS, True)
+    torch.testing.assert_close(output.cpu(), _golden(*case, half_boundary=True),
+                               atol=0.025, rtol=0.002)
 
 
 def test_tp4_fused_rejects_half_boundary(native_op):
@@ -265,9 +276,9 @@ def test_preflight_error_submits_no_kernel(native_op, invalid):
     (12, 2560, True, 1),
     (12, 2560, False, 2),
     (12, 256, True, 2),
-    (6, 2560, True, 2),
+    (6, 2560, True, 1),
 ])
-def test_one_kernel_only_for_tp4_sigmoid(native_op, hv, n, sigmoid, kernels):
+def test_one_kernel_for_tp4_tp8_sigmoid(native_op, hv, n, sigmoid, kernels):
     from torch.profiler import ProfilerActivity, profile
 
     case = [tensor.to("xpu") for tensor in _case(hv=hv, n=n)]

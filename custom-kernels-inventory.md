@@ -41,3 +41,9 @@ Pybind direct Tensor ABI需要对应 CPython/Torch，不能标成abi3扩展。
 安装前备份/hash核对，通过新进程确认真实导入路径，不把build-only环境变量
 当作默认安装完成。完整模型 async/MTP、多模态、准确性和 E2E 仍以运行记录
 为准，代码/算子单测存在不代表整链验收。
+
+## Qwen3.8 TP8 INT4 attention 输出投影
+M1 `[1,768]` 到 `[1,2560]` 的 Q4_0 输出投影使用每个 SG16 两行、
+每个工作组一个 subgroup，保留原通用 kernel 的逐 lane FP32 FMA 链、
+signed scale、SG16 归约及未对齐 storage offset 契约。
+其余形状与 M>1 的工作组打包保持原配置。

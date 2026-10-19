@@ -357,7 +357,7 @@ def test_m1_tuning_default_dispatch_and_legacy(
             assert space.try_run(*args) is not None
         names = [event.name for event in prof.events()]
         assert any("RouterBlockKernel<8>" in name for name in names) == (
-            not legacy and rows == 1 and case["k"] == 160)
+            not legacy and rows == 1)
         assert any("TopKPackedSubgroupKernel" in name for name in names) == (
             not legacy and rows == 1)
         hit_down = any("DownBlockKernel<160, 16, 16, true>" in name

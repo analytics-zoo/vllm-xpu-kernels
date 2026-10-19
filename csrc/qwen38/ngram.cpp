@@ -6,6 +6,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUCachingAllocator.h>
 #include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 #include <sycl/sycl.hpp>
 
 #include <array>
@@ -104,6 +105,7 @@ void record_xpu(const at::Tensor& t, c10::xpu::XPUStream stream) {
 
 template <bool ResetEos>
 class NGramDecodeIdsKernel;
+template <bool Packed>
 class NGramHostLookupKernel;
 
 }  // namespace
@@ -194,6 +196,73 @@ void ngram_decode_ids_eos(
       input_ids, context, multipliers, output, eos_token_id);
 }
 
+template <bool Packed>
+static void launch_host_lookup(
+    sycl::queue& queue,
+    std::array<const uint16_t*, 8> tables,
+    const int64_t* indices,
+    uint16_t* result,
+    size_t rows,
+    int64_t vocab_start,
+    int64_t vocab_end,
+    int64_t chunk_rows,
+    int64_t chunk_count) {
+  constexpr int kLocalSize = Packed ? 16 : 64;
+  queue.parallel_for<NGramHostLookupKernel<Packed>>(
+      sycl::nd_range<1>(rows * kLocalSize, kLocalSize),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+        const size_t row = item.get_group_linear_id();
+        const size_t lane = item.get_local_linear_id();
+        const int64_t global = indices[row];
+        const bool owned = global >= vocab_start && global < vocab_end;
+        int64_t bank = 0, offset = 0;
+        if (owned) {
+          const int64_t local = global - vocab_start;
+          if (chunk_count == 1) {
+            offset = local;
+          } else if (chunk_count == 2) {
+            bank = local >= chunk_rows;
+            offset = local - bank * chunk_rows;
+          } else {
+            bank = local / chunk_rows;
+            offset = local % chunk_rows;
+          }
+        }
+        if constexpr (Packed) {
+          // One subgroup copies an entire 160-element head as raw bits.
+          // The caller checked every base pointer for 32-bit alignment.
+          namespace sx = sycl::ext::oneapi::experimental;
+          constexpr auto props = sx::properties{
+              sx::data_placement_striped,
+              sx::contiguous_memory,
+              sx::full_group,
+              sx::alignment<4>};
+          sycl::vec<uint32_t, 4> data(0);
+          uint32_t tail = 0;
+          if (owned) {
+            const auto* source =
+                reinterpret_cast<const uint32_t*>(tables[bank] + offset * 160);
+            auto ptr = sycl::address_space_cast<
+                           sycl::access::address_space::global_space,
+                           sycl::access::decorated::yes>(source)
+                           .get_decorated();
+            sx::group_load(item.get_sub_group(), ptr, data, props);
+            tail = source[64 + lane];
+          }
+          auto* target = reinterpret_cast<uint32_t*>(result) + row * 80;
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            target[lane + j * 16] = data[j];
+          target[64 + lane] = tail;
+        } else {
+          for (size_t col = lane; col < 160; col += 64) {
+            result[row * 160 + col] =
+                owned ? tables[bank][offset * 160 + col] : uint16_t(0);
+          }
+        }
+      });
+}
+
 at::Tensor ngram_host_lookup_chunked(
     at::TensorList weights,
     const at::Tensor& ids,
@@ -277,31 +346,34 @@ at::Tensor ngram_host_lookup_chunked(
   auto* result = static_cast<uint16_t*>(output.data_ptr());
   const size_t rows = ids.numel();
   const int64_t chunk_count = weights.size();
-  queue.parallel_for<NGramHostLookupKernel>(
-      sycl::nd_range<1>(rows * 64, 64),
-      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-        const size_t row = item.get_group_linear_id();
-        const size_t lane = item.get_local_linear_id();
-        const int64_t global = indices[row];
-        const bool owned = global >= vocab_start && global < vocab_end;
-        int64_t bank = 0, offset = 0;
-        if (owned) {
-          const int64_t local = global - vocab_start;
-          if (chunk_count == 1) {
-            offset = local;
-          } else if (chunk_count == 2) {
-            bank = local >= chunk_rows;
-            offset = local - bank * chunk_rows;
-          } else {
-            bank = local / chunk_rows;
-            offset = local % chunk_rows;
-          }
-        }
-        for (size_t col = lane; col < 160; col += 64) {
-          result[row * 160 + col] =
-              owned ? tables[bank][offset * 160 + col] : uint16_t(0);
-        }
-      });
+  uintptr_t alignment = reinterpret_cast<uintptr_t>(result);
+  for (const auto* table : tables) {
+    alignment |= reinterpret_cast<uintptr_t>(table);
+  }
+  if ((alignment & 3u) == 0) {
+    launch_host_lookup<true>(
+        queue,
+        tables,
+        indices,
+        result,
+        rows,
+        vocab_start,
+        vocab_end,
+        chunk_rows,
+        chunk_count);
+  } else {
+    // Contiguous half/BF16 offset views can be only two-byte aligned.
+    launch_host_lookup<false>(
+        queue,
+        tables,
+        indices,
+        result,
+        rows,
+        vocab_start,
+        vocab_end,
+        chunk_rows,
+        chunk_count);
+  }
   return output;
 }
 

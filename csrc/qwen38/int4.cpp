@@ -165,23 +165,36 @@ struct Projection {
   int n1;
 };
 
-template <int Rows, bool Fused, bool FixedTP4, int Subgroup>
+template <int Rows, bool Fused, bool FixedTP4, int Subgroup, int GroupSgs>
 class WideLinearKernel;
 
 // Subgroup block reads cover four scale groups per iteration. Each input
 // uint64 and weight uint16 contain four corresponding FP16/INT4 elements.
-template <int Rows, bool Fused, bool FixedTP4 = false, int Subgroup = 16>
+template <
+    int Rows,
+    bool Fused,
+    bool FixedTP4 = false,
+    int Subgroup = 16,
+    int GroupSgs = 1>
 void launch_wide_linear(sycl::queue& queue, Projection p) {
   constexpr int sg_size = Subgroup;
   constexpr int words_per_load = 128 / sg_size;
   constexpr int accumulators = 128 / sg_size;
   const size_t row_tiles = (int64_t(p.n0) + p.n1 + Rows - 1) / Rows;
-  queue.parallel_for<WideLinearKernel<Rows, Fused, FixedTP4, Subgroup>>(
-      sycl::nd_range<1>(row_tiles * sg_size, sg_size),
+  queue.parallel_for<
+      WideLinearKernel<Rows, Fused, FixedTP4, Subgroup, GroupSgs>>(
+      sycl::nd_range<1>(
+          ((row_tiles + GroupSgs - 1) / GroupSgs) * GroupSgs * sg_size,
+          GroupSgs * sg_size),
       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
         const auto sg = item.get_sub_group();
         const int lane = sg.get_local_linear_id();
-        const int row_base = item.get_group_linear_id() * Rows;
+        const int task = item.get_group_linear_id() * GroupSgs +
+                         int(sg.get_group_linear_id());
+        if constexpr (GroupSgs > 1) {
+          if (task >= row_tiles) return;
+        }
+        const int row_base = task * Rows;
         // Fused tiles do not straddle the two matrices. Resolve their
         // pointers once rather than in every K iteration and output row.
         const int n0 = FixedTP4 ? 4096 : p.n0;
@@ -295,21 +308,22 @@ void launch_wide_linear(sycl::queue& queue, Projection p) {
       });
 }
 
-template <int Rows, int Tokens>
+template <int Rows, int Tokens, int GroupSgs>
 class LinearKernel;
 
 // A subgroup cooperates on K, keeps several output rows in registers, and
 // reuses each dequantized weight across a small token tile. Reduction occurs
 // only after the full K loop, not after each quantization group.
-template <int Rows, int Tokens>
+template <int Rows, int Tokens, int GroupSgs = 8>
 void launch_linear(sycl::queue& queue, Projection p) {
   constexpr int sg_size = 16;
-  constexpr int local_size = 128;
+  constexpr int local_size = GroupSgs * sg_size;
   const int64_t row_tiles = (int64_t(p.n0) + p.n1 + Rows - 1) / Rows;
   const int64_t token_tiles = (p.m + Tokens - 1) / Tokens;
   const size_t subgroups = row_tiles * token_tiles;
-  const size_t global_size = ((subgroups + 7) / 8) * local_size;
-  queue.parallel_for<LinearKernel<Rows, Tokens>>(
+  const size_t global_size =
+      ((subgroups + GroupSgs - 1) / GroupSgs) * local_size;
+  queue.parallel_for<LinearKernel<Rows, Tokens, GroupSgs>>(
       sycl::nd_range<1>(global_size, local_size),
       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
         const auto sg = item.get_sub_group();
@@ -363,8 +377,9 @@ void launch_linear(sycl::queue& queue, Projection p) {
                 if constexpr (Tokens > 1) {
                   // Match the small-M DPAS and original M>1 Q4_0 contract:
                   // dequantization rounds once to FP16 before FP32 MMA.
-                  const auto rounded = sycl::vec<float, 1>(w)
-                      .template convert<half, sycl::rounding_mode::rte>();
+                  const auto rounded =
+                      sycl::vec<float, 1>(w)
+                          .template convert<half, sycl::rounding_mode::rte>();
                   // The BMG/2025.3 lowering can eliminate a half->float
                   // round trip, even for explicit convert<half, rte>(). A
                   // volatile bit observation retains the required boundary.
@@ -421,18 +436,32 @@ Projection projection(
 }
 
 void dispatch_linear(sycl::queue& queue, Projection p) {
-  if (p.n1 == 0 && launch_int4_small_m(
-                       queue, p.input, p.weight0, p.scale0, p.output0,
-                       p.m, p.n0, p.k)) {
+  if (p.n1 == 0 &&
+      launch_int4_small_m(
+          queue, p.input, p.weight0, p.scale0, p.output0, p.m, p.n0, p.k)) {
     return;
   }
   const bool block_aligned = ((reinterpret_cast<uintptr_t>(p.input) |
                                reinterpret_cast<uintptr_t>(p.weight0) |
                                reinterpret_cast<uintptr_t>(p.weight1)) &
                               3u) == 0;
+  // TP8 attention output: expose more independent rows without changing
+  // the generic path's single FP32 FMA chain or its SG16 reduction tree.
+  if (p.m == 1 && p.n0 == 2560 && p.n1 == 0 && p.k == 768) {
+    launch_linear<2, 1, 1>(queue, p);
+    return;
+  }
   if (p.m == 1 && p.k % 512 == 0 && p.n0 + p.n1 >= 128 && block_aligned) {
     if (p.n1 == 0) {
-      launch_wide_linear<2, false>(queue, p);
+      // QSA's replicated indexer and TP8 main Q/gate/K/V projection.
+      // Independent subgroups retain the existing per-row accumulation tree.
+      if (p.k == 2560 && p.n0 == 640) {
+        launch_wide_linear<1, false, false, 16, 4>(queue, p);
+      } else if (p.k == 2560 && p.n0 == 2048) {
+        launch_wide_linear<1, false>(queue, p);
+      } else {
+        launch_wide_linear<2, false>(queue, p);
+      }
     } else if (
         p.n0 == 4096 && p.n1 == 24 && p.k == 2560 &&
         ((reinterpret_cast<uintptr_t>(p.scale0) |
