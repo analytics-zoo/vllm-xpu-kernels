@@ -595,6 +595,27 @@ if(QWEN38_KERNELS_ENABLED)
     PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED
     NO_DEFAULT_PATH)
   define_gpu_extension_target(
+    _qwen38_fp8_C
+    DESTINATION
+    vllm_xpu_kernels
+    LANGUAGE
+    ${VLLM_GPU_LANG}
+    SOURCES
+    "csrc/qwen38/fp8.cpp"
+    COMPILE_FLAGS
+    ${VLLM_GPU_COMPILE_FLAGS}
+    ${VLLM_CUTLASS_FLAGS}
+    "-ffp-contract=off"
+    LINK_FLAGS
+    ${VLLM_GPU_LINK_FLAGS}
+    LIBRARIES
+    ${QWEN38_TORCH_PYTHON_LIBRARY}
+    INCLUDE_DIRECTORIES
+    ${VLLM_XPU_INCLUDE_DIR}
+    ${CUTLASS_INCLUDE_DIR}
+    ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+    WITH_SOABI)
+  define_gpu_extension_target(
     _qwen38_C
     DESTINATION
     vllm_xpu_kernels
