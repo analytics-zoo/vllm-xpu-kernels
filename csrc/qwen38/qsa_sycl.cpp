@@ -41,11 +41,11 @@ constexpr int kSg = 16;
 
 template <typename T, bool PowerOfTwo>
 class CompressKernel;
-template <int PageSize, bool BlockRead, int Subgroup>
+template <int PageSize, bool BlockRead, int Subgroup, int Prefetch>
 class AttentionPhase0;
 template <int PageSize>
 class AttentionPrefillQkDpasPhase0;
-template <int Columns>
+template <int Columns, int Prefetch>
 class AttentionPhase1;
 
 void check_xpu(
@@ -431,7 +431,7 @@ sycl::event launch_prefill_qk_dpas_phase0(
   });
 }
 
-template <int PageSize, bool BlockRead, int Subgroup>
+template <int PageSize, bool BlockRead, int Subgroup, int Prefetch = 1>
 sycl::event launch_phase0(
     sycl::queue& queue,
     const half* q,
@@ -456,7 +456,7 @@ sycl::event launch_phase0(
     if (has_previous) cgh.depends_on(previous);
     sycl::local_accessor<float, 1> scratch(
         sycl::range<1>(workers * (kPartialStride)), cgh);
-    cgh.parallel_for<AttentionPhase0<PageSize, BlockRead, Subgroup>>(
+    cgh.parallel_for<AttentionPhase0<PageSize, BlockRead, Subgroup, Prefetch>>(
         sycl::nd_range<1>(
             sycl::range<1>(groups * Subgroup * workers),
             sycl::range<1>(Subgroup * workers)),
@@ -504,80 +504,196 @@ sycl::event launch_phase0(
           float maximum = -1.0e30f;
           float denominator = 0.0f;
           const int per_worker = tokens_per_partial / workers;
-          for (int t = 0; t < per_worker; ++t) {
-            const int slot =
-                partial * tokens_per_partial + worker * per_worker + t;
-            const int logical = slot < kSlots ? row_indices[slot] : -1;
-            const int logical_page = logical >= 0 ? logical / PageSize : -1;
-            const bool table_ok = valid_request && logical_page >= 0 &&
-                                  logical_page < table_stride;
-            const int physical =
-                table_ok ? table[request * table_stride + logical_page] : -1;
-            const bool valid = physical >= 0 && physical < physical_pages;
-            if (!valid) {
-              continue;
-            }
-            const int64_t base = (static_cast<int64_t>(physical) * PageSize +
-                                  (logical % PageSize)) *
-                                 512;
-            const half* kv = packed + base;
-            float dot = 0.0f;
-            sycl::vec<uint32_t, values_per_lane / 2> key_words;
-            sycl::vec<uint32_t, values_per_lane / 2> value_words;
-            if constexpr (BlockRead) {
-              sx::group_load(
-                  item.get_sub_group(),
-                  sycl::address_space_cast<
-                      sycl::access::address_space::global_space,
-                      sycl::access::decorated::yes>(
-                      reinterpret_cast<const uint32_t*>(kv)),
-                  key_words,
-                  props);
-              sx::group_load(
-                  item.get_sub_group(),
-                  sycl::address_space_cast<
-                      sycl::access::address_space::global_space,
-                      sycl::access::decorated::yes>(
-                      reinterpret_cast<const uint32_t*>(kv + 256)),
-                  value_words,
-                  props);
-            }
-#pragma unroll
-            for (int d = 0; d < values_per_lane; ++d) {
-              float key;
-              if constexpr (BlockRead) {
-                const uint32_t bits = key_words[d / 2];
-                key = static_cast<float>(sycl::bit_cast<half>(
-                    uint16_t((d & 1) ? bits >> 16 : bits)));
-              } else {
-                key = static_cast<float>(kv[lane * values_per_lane + d]);
+          // Prefetch changes only read scheduling; every head keeps the same
+          // token, FP32 dot/reduce, online-softmax and partial-merge order.
+          if constexpr (Prefetch == 1) {
+            for (int t = 0; t < per_worker; ++t) {
+              const int slot =
+                  partial * tokens_per_partial + worker * per_worker + t;
+              const int logical = slot < kSlots ? row_indices[slot] : -1;
+              const int logical_page = logical >= 0 ? logical / PageSize : -1;
+              const bool table_ok = valid_request && logical_page >= 0 &&
+                                    logical_page < table_stride;
+              const int physical =
+                  table_ok ? table[request * table_stride + logical_page] : -1;
+              const bool valid = physical >= 0 && physical < physical_pages;
+              if (!valid) {
+                continue;
               }
-              dot += query[d] * key;
-            }
-            dot = sycl::reduce_over_group(
-                item.get_sub_group(), dot, sycl::plus<float>());
-            const float score = dot * 0.0625f;
-            const float next_max = sycl::fmax(maximum, score);
-            constexpr float log2_e = 1.4426950408889634f;
-            const float rescale =
-                sycl::native::exp2((maximum - next_max) * log2_e);
-            const float probability =
-                sycl::native::exp2((score - next_max) * log2_e);
-            denominator = denominator * rescale + probability;
-#pragma unroll
-            for (int d = 0; d < values_per_lane; ++d) {
-              float value;
+              const int64_t base = (static_cast<int64_t>(physical) * PageSize +
+                                    (logical % PageSize)) *
+                                   512;
+              const half* kv = packed + base;
+              float dot = 0.0f;
+              sycl::vec<uint32_t, values_per_lane / 2> key_words;
+              sycl::vec<uint32_t, values_per_lane / 2> value_words;
               if constexpr (BlockRead) {
-                const uint32_t bits = value_words[d / 2];
-                value = static_cast<float>(sycl::bit_cast<half>(
-                    uint16_t((d & 1) ? bits >> 16 : bits)));
-              } else {
-                value =
-                    static_cast<float>(kv[256 + lane * values_per_lane + d]);
+                sx::group_load(
+                    item.get_sub_group(),
+                    sycl::address_space_cast<
+                        sycl::access::address_space::global_space,
+                        sycl::access::decorated::yes>(
+                        reinterpret_cast<const uint32_t*>(kv)),
+                    key_words,
+                    props);
+                sx::group_load(
+                    item.get_sub_group(),
+                    sycl::address_space_cast<
+                        sycl::access::address_space::global_space,
+                        sycl::access::decorated::yes>(
+                        reinterpret_cast<const uint32_t*>(kv + 256)),
+                    value_words,
+                    props);
               }
-              output[d] = output[d] * rescale + probability * value;
+#pragma unroll
+              for (int d = 0; d < values_per_lane; ++d) {
+                float key;
+                if constexpr (BlockRead) {
+                  const uint32_t bits = key_words[d / 2];
+                  key = static_cast<float>(sycl::bit_cast<half>(
+                      uint16_t((d & 1) ? bits >> 16 : bits)));
+                } else {
+                  key = static_cast<float>(kv[lane * values_per_lane + d]);
+                }
+                dot += query[d] * key;
+              }
+              dot = sycl::reduce_over_group(
+                  item.get_sub_group(), dot, sycl::plus<float>());
+              const float score = dot * 0.0625f;
+              const float next_max = sycl::fmax(maximum, score);
+              constexpr float log2_e = 1.4426950408889634f;
+              const float rescale =
+                  sycl::native::exp2((maximum - next_max) * log2_e);
+              const float probability =
+                  sycl::native::exp2((score - next_max) * log2_e);
+              denominator = denominator * rescale + probability;
+#pragma unroll
+              for (int d = 0; d < values_per_lane; ++d) {
+                float value;
+                if constexpr (BlockRead) {
+                  const uint32_t bits = value_words[d / 2];
+                  value = static_cast<float>(sycl::bit_cast<half>(
+                      uint16_t((d & 1) ? bits >> 16 : bits)));
+                } else {
+                  value =
+                      static_cast<float>(kv[256 + lane * values_per_lane + d]);
+                }
+                output[d] = output[d] * rescale + probability * value;
+              }
+              maximum = next_max;
             }
-            maximum = next_max;
+          } else {
+            static_assert(Prefetch == 2 && BlockRead && Subgroup == 32);
+            // Cache each worker's index/page vector once; only metadata access
+            // changes. A holed list keeps all valid tokens in original order.
+            const auto sg = item.get_sub_group();
+            const int first_slot =
+                partial * tokens_per_partial + worker * per_worker;
+            const int cached_logical =
+                lane < per_worker && first_slot + lane < kSlots
+                    ? row_indices[first_slot + lane]
+                    : -1;
+            const int cached_page =
+                cached_logical >= 0 ? cached_logical / PageSize : -1;
+            const bool cached_table_ok =
+                valid_request && cached_page >= 0 && cached_page < table_stride;
+            const int cached_physical =
+                cached_table_ok ? table[request * table_stride + cached_page]
+                                : -1;
+            const bool cached_valid =
+                cached_physical >= 0 && cached_physical < physical_pages;
+            const int last_live = sycl::reduce_over_group(
+                sg, cached_valid ? lane : -1, sycl::maximum<int>());
+
+            static_assert(BlockRead);
+            for (int first = 0; first <= last_live; first += Prefetch) {
+              sycl::vec<uint32_t, values_per_lane / 2> key_batch[Prefetch],
+                  value_batch[Prefetch];
+              int64_t bases[Prefetch] = {};
+              bool valid_batch[Prefetch] = {};
+#pragma unroll
+              for (int b = 0; b < Prefetch; ++b) {
+                const int t = first + b;
+                if (t >= per_worker) continue;
+                const int logical =
+                    sycl::select_from_group(sg, cached_logical, t);
+                const int physical =
+                    sycl::select_from_group(sg, cached_physical, t);
+                const bool valid = physical >= 0 && physical < physical_pages;
+                valid_batch[b] = valid;
+                if (!valid) {
+                  continue;
+                }
+                const int64_t base =
+                    (static_cast<int64_t>(physical) * PageSize +
+                     (logical % PageSize)) *
+                    512;
+                bases[b] = base;
+                const half* kv = packed + base;
+                if constexpr (BlockRead) {
+                  sx::group_load(
+                      item.get_sub_group(),
+                      sycl::address_space_cast<
+                          sycl::access::address_space::global_space,
+                          sycl::access::decorated::yes>(
+                          reinterpret_cast<const uint32_t*>(kv)),
+                      key_batch[b],
+                      props);
+                  sx::group_load(
+                      item.get_sub_group(),
+                      sycl::address_space_cast<
+                          sycl::access::address_space::global_space,
+                          sycl::access::decorated::yes>(
+                          reinterpret_cast<const uint32_t*>(kv + 256)),
+                      value_batch[b],
+                      props);
+                }
+              }
+#pragma unroll
+              for (int b = 0; b < Prefetch; ++b) {
+                if (!valid_batch[b]) continue;
+                const half* kv = packed + bases[b];
+                const auto key_words = key_batch[b];
+                const auto value_words = value_batch[b];
+                float dot = 0.0f;
+#pragma unroll
+                for (int d = 0; d < values_per_lane; ++d) {
+                  float key;
+                  if constexpr (BlockRead) {
+                    const uint32_t bits = key_words[d / 2];
+                    key = static_cast<float>(sycl::bit_cast<half>(
+                        uint16_t((d & 1) ? bits >> 16 : bits)));
+                  } else {
+                    key = static_cast<float>(kv[lane * values_per_lane + d]);
+                  }
+                  dot += query[d] * key;
+                }
+                dot = sycl::reduce_over_group(
+                    item.get_sub_group(), dot, sycl::plus<float>());
+                const float score = dot * 0.0625f;
+                const float next_max = sycl::fmax(maximum, score);
+                constexpr float log2_e = 1.4426950408889634f;
+                const float rescale =
+                    sycl::native::exp2((maximum - next_max) * log2_e);
+                const float probability =
+                    sycl::native::exp2((score - next_max) * log2_e);
+                denominator = denominator * rescale + probability;
+#pragma unroll
+                for (int d = 0; d < values_per_lane; ++d) {
+                  float value;
+                  if constexpr (BlockRead) {
+                    const uint32_t bits = value_words[d / 2];
+                    value = static_cast<float>(sycl::bit_cast<half>(
+                        uint16_t((d & 1) ? bits >> 16 : bits)));
+                  } else {
+                    value = static_cast<float>(
+                        kv[256 + lane * values_per_lane + d]);
+                  }
+                  output[d] = output[d] * rescale + probability * value;
+                }
+                maximum = next_max;
+              }
+            }
           }
           const int local_offset = worker * kPartialStride;
           if (lane == 0) {
@@ -635,7 +751,7 @@ sycl::event launch_phase0(
   });
 }
 
-template <int Columns>
+template <int Columns, int Prefetch = 1>
 sycl::event launch_phase1_columns(
     sycl::queue& queue,
     sycl::event phase0,
@@ -652,7 +768,7 @@ sycl::event launch_phase1_columns(
     cgh.depends_on(phase0);
     sycl::local_accessor<float, 1> weights(
         sycl::range<1>(kStoragePartials), cgh);
-    cgh.parallel_for<AttentionPhase1<Columns>>(
+    cgh.parallel_for<AttentionPhase1<Columns, Prefetch>>(
         sycl::nd_range<1>(
             sycl::range<1>(groups * merge_wg), sycl::range<1>(merge_wg)),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSg)]] {
@@ -679,12 +795,36 @@ sycl::event launch_phase1_columns(
           }
           item.barrier(sycl::access::fence_space::local_space);
           float accumulation[values] = {};
-          for (int p = 0; p < partial_count; ++p) {
-            const float* part = head_partials + p * kPartialStride;
+          if constexpr (Prefetch == 1) {
+            for (int p = 0; p < partial_count; ++p) {
+              const float* part = head_partials + p * kPartialStride;
 #pragma unroll
-            for (int d = 0; d < values; ++d) {
-              accumulation[d] +=
-                  weights[p] * part[2 + tile * Columns + lane * values + d];
+              for (int d = 0; d < values; ++d) {
+                accumulation[d] +=
+                    weights[p] * part[2 + tile * Columns + lane * values + d];
+              }
+            }
+          } else {
+            for (int first = 0; first < partial_count; first += Prefetch) {
+              float factors[Prefetch] = {};
+              float loaded[Prefetch][values] = {};
+#pragma unroll
+              for (int b = 0; b < Prefetch; ++b) {
+                const int p = first + b;
+                if (p >= partial_count) continue;
+                factors[b] = weights[p];
+                const float* part = head_partials + p * kPartialStride;
+#pragma unroll
+                for (int d = 0; d < values; ++d)
+                  loaded[b][d] = part[2 + tile * Columns + lane * values + d];
+              }
+#pragma unroll
+              for (int b = 0; b < Prefetch; ++b) {
+                if (first + b >= partial_count) continue;
+#pragma unroll
+                for (int d = 0; d < values; ++d)
+                  accumulation[d] += factors[b] * loaded[b][d];
+              }
             }
           }
           const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
@@ -709,6 +849,9 @@ sycl::event launch_phase1(
   // Column ownership changes only; the reduction and per-column FP32 order
   // stay identical. A one-row tail of a larger batch is not the M1 path.
   const char* tile = std::getenv("VLLM_XPU_QWEN38_QSA_M1_MERGE_TILE");
+  if (m1_scope && !tile)
+    return launch_phase1_columns<64, 4>(
+        queue, phase0, partials, output, rows, heads, partial_count);
   if (m1_scope && tile && std::strcmp(tile, "64") == 0)
     return launch_phase1_columns<64>(
         queue, phase0, partials, output, rows, heads, partial_count);
@@ -1084,7 +1227,8 @@ at::Tensor token_split_attention_v3(
       return launch_phase0<
           decltype(page_tag)::value,
           decltype(block_tag)::value,
-          32>(
+          32,
+          decltype(block_tag)::value ? 2 : 1>(
           queue,
           row_q,
           packed_ptr,
@@ -1185,11 +1329,290 @@ constexpr int kSelectionSg = 32;
 constexpr int kSelectionPartitions = 32;
 constexpr int kWorkspaceRowStride = kSelectionPartitions * kTopBlocks;
 
-template <int PageSize>
+template <int Page>
+class SelectionSplitScore;
+template <int Page>
+sycl::event launch_selection_split_score(
+    sycl::queue& queue,
+    const half* q,
+    const half* cache,
+    const int32_t* table,
+    const int32_t* reqs,
+    const int64_t* positions,
+    const int32_t* lengths,
+    float* sa,
+    int32_t* ia,
+    float* sb,
+    int32_t* ib,
+    int requests,
+    int table_stride,
+    int physical_pages,
+    int64_t page_stride,
+    int64_t row_stride,
+    int captured_bpp,
+    sycl::event previous,
+    bool has_previous) {
+  constexpr int Groups = 256, Subgroups = 8;
+  return queue.submit([&](sycl::handler& cgh) {
+    if (has_previous) cgh.depends_on(previous);
+    cgh.parallel_for<SelectionSplitScore<Page>>(
+        sycl::nd_range<1>(Groups * Subgroups * 32, Subgroups * 32),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+          auto sg = item.get_sub_group();
+          const int lane = sg.get_local_linear_id();
+          const int task = item.get_group_linear_id() * Subgroups +
+                           int(sg.get_group_linear_id());
+          const int req = reqs[0];
+          const bool request_ok = req >= 0 && req < requests;
+          const int64_t seq =
+              request_ok ? sycl::max(int64_t(lengths[req]), int64_t(0)) : 0;
+          const int64_t visible =
+              sycl::min(sycl::max(positions[0] + 1, int64_t(0)), seq) / 4;
+          const int64_t limit = sycl::min(visible, int64_t(32) * captured_bpp);
+          if (task >= limit) return;
+          const int per_group = int((limit + 31) / 32);
+          const int bpp = sycl::max(512, ((per_group + 511) / 512) * 512);
+          float query[4][4];
+          {
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+#pragma unroll
+              for (int frag = 0; frag < 4; ++frag)
+                query[h][frag] = float(q[h * 128 + lane + frag * 32]);
+            }
+          }
+          for (int logical = task; logical < limit;
+               logical += Groups * Subgroups) {
+            const int lp = logical / Page;
+            int physical = -1;
+            if (request_ok && lp < table_stride)
+              physical = table[req * table_stride + lp];
+            const bool valid = physical >= 0 && physical < physical_pages;
+            float score = -std::numeric_limits<float>::infinity();
+            if (valid) {
+              const int64_t offset = int64_t(physical) * page_stride +
+                                     (logical % Page) * row_stride;
+              float dot[4] = {};
+#pragma unroll
+              for (int frag = 0; frag < 4; ++frag) {
+                const int dim = lane + frag * 32;
+                const float key = float(cache[offset + dim]);
+#pragma unroll
+                for (int h = 0; h < 4; ++h)
+                  dot[h] += query[h][frag] * key;
+              }
+              score = 0;
+#pragma unroll
+              for (int h = 0; h < 4; ++h) {
+                const float value =
+                    sycl::reduce_over_group(sg, dot[h], sycl::plus<float>());
+                score += sycl::fmax(value, 0.0f);
+              }
+              score *= 0.08838834764831845f;
+            }
+            if (lane == 0) {
+              const int partition = logical / bpp, within = logical % bpp,
+                        chunk = within / 512,
+                        at = partition * 512 + within % 512;
+              if (chunk == 0)
+                sa[at] = score;
+              else if (chunk == 1)
+                ia[at] = sycl::bit_cast<int32_t>(score);
+              else if (chunk == 2)
+                sb[at] = score;
+              else
+                ib[at] = sycl::bit_cast<int32_t>(score);
+            }
+          }
+        });
+  });
+}
+
+// Valid QSA scores are nonnegative after fmax; zero is reserved for a
+// missing index. The low 32 bits retain the lower-logical-index tie rule.
+inline uint64_t selection_score_key(float score, int32_t index) {
+  return index < 0 ? uint64_t(0)
+                   : (uint64_t(sycl::bit_cast<uint32_t>(score)) << 32) |
+                         (uint64_t(UINT32_MAX) - uint32_t(index));
+}
+inline float selection_key_score(uint64_t key) {
+  return key ? sycl::bit_cast<float>(uint32_t(key >> 32))
+             : -std::numeric_limits<float>::infinity();
+}
+inline int32_t selection_key_index(uint64_t key) {
+  return key ? int32_t(UINT32_MAX - uint32_t(key)) : -1;
+}
+// Hierarchical merge with all dependent levels inside one workgroup.
+template <int FanIn, bool Final>
+class SelectionFold;
+template <int FanIn, bool Final>
+sycl::event launch_selection_fold(
+    sycl::queue& queue,
+    sycl::event previous,
+    const float* srcs,
+    const int32_t* srci,
+    float* dsts,
+    int32_t* dsti,
+    const int32_t* reqs,
+    const int64_t* positions,
+    const int32_t* lengths,
+    int32_t* out,
+    int requests,
+    int groups,
+    int captured_bpp) {
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(previous);
+    sycl::local_accessor<uint64_t, 1> a(FanIn * 512, cgh), b(FanIn * 256, cgh);
+    cgh.parallel_for<SelectionFold<FanIn, Final>>(
+        sycl::nd_range<1>(groups * 1024, 1024),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+          const int group = it.get_group_linear_id(),
+                    lane = it.get_local_linear_id();
+          const int request = reqs[0],
+                    seq = request >= 0 && request < requests
+                              ? sycl::max(lengths[request], 0)
+                              : 0;
+          const int64_t visible = sycl::max(positions[0] + 1, int64_t(0));
+          const int64_t blocks = sycl::min(visible, int64_t(seq)) / 4;
+          const int per_group =
+              int((sycl::min(blocks, int64_t(32) * captured_bpp) + 31) / 32);
+          const int bpp = sycl::max(512, ((per_group + 511) / 512) * 512);
+          const int covered = 32 / groups;
+          const bool empty = int64_t(group) * covered * bpp >= blocks;
+          const bool only_left =
+              int64_t(group * covered + covered / FanIn) * bpp >= blocks;
+          uint64_t key = 0;
+          if (empty || only_left) {
+            if (lane < 512 && !empty)
+              key = selection_score_key(
+                  srcs[group * FanIn * 512 + lane],
+                  srci[group * FanIn * 512 + lane]);
+          } else {
+            for (int i = lane; i < FanIn * 512; i += 1024)
+              a[i] = selection_score_key(
+                  srcs[group * FanIn * 512 + i], srci[group * FanIn * 512 + i]);
+            it.barrier(sycl::access::fence_space::local_space);
+            bool source_a = true;
+            for (int lists = FanIn; lists > 1; lists /= 2) {
+              for (int task = lane; task < (lists / 2) * 512; task += 1024) {
+                const int pair = task / 512, k = task % 512 + 1,
+                          base = pair * 1024;
+                int lo = 0, hi = k;
+                auto get = [&](int x) { return source_a ? a[x] : b[x]; };
+                while (lo < hi) {
+                  int i = (lo + hi + 1) / 2, j = k - i;
+                  if (get(base + i - 1) >= get(base + 512 + j))
+                    lo = i;
+                  else
+                    hi = i - 1;
+                }
+                const int i = lo, j = k - i;
+                uint64_t winner =
+                    i == 0 ? get(base + 512 + j - 1)
+                    : j == 0
+                        ? get(base + i - 1)
+                        : sycl::min(get(base + i - 1), get(base + 512 + j - 1));
+                if (source_a)
+                  b[task] = winner;
+                else
+                  a[task] = winner;
+              }
+              it.barrier(sycl::access::fence_space::local_space);
+              source_a = !source_a;
+            }
+            if (lane < 512) key = source_a ? a[lane] : b[lane];
+          }
+          if (lane >= 512) return;
+          const int block = selection_key_index(key);
+          if constexpr (Final) {
+            const int selected = int(sycl::min(blocks, int64_t(512)));
+            const int64_t tail_start = visible / 4 * 4,
+                          tail = visible - tail_start;
+#pragma unroll
+            for (int offset = 0; offset < 4; ++offset) {
+              int token = block * 4 + offset;
+              out[lane * 4 + offset] =
+                  lane < selected && block >= 0 && token < seq ? token
+                  : lane == selected && offset < tail &&
+                          tail_start + offset < seq
+                      ? int32_t(tail_start + offset)
+                      : -1;
+            }
+            if (lane < 3)
+              out[2048 + lane] =
+                  selected == 512 && lane < tail && tail_start + lane < seq
+                      ? int32_t(tail_start + lane)
+                      : -1;
+          } else {
+            dsts[group * 512 + lane] = selection_key_score(key);
+            dsti[group * 512 + lane] = block;
+          }
+        });
+  });
+}
+// Fixed networks keep shuffle distances compile-time constants; score and id
+// remain separate 32-bit registers. Two SLM banks avoid a read/write race.
+template <int Count>
+inline void hybrid_float_top(
+    sycl::nd_item<1> item,
+    sycl::local_accessor<float, 1> scores,
+    sycl::local_accessor<int32_t, 1> ids,
+    int offset) {
+  const int lane = item.get_local_linear_id();
+  auto sg = item.get_sub_group();
+  float score = lane < Count ? scores[offset + lane]
+                             : -std::numeric_limits<float>::infinity();
+  int32_t id = lane < Count ? ids[offset + lane] : -1;
+  int bank = 0;
+#pragma unroll
+  for (int size = 2; size <= Count; size <<= 1) {
+#pragma unroll
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      float other;
+      int32_t oi;
+      if (stride >= 32) {
+        if (lane < Count) {
+          scores[bank * 1024 + lane] = score;
+          ids[bank * 1024 + lane] = id;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        other = lane < Count ? scores[bank * 1024 + (lane ^ stride)] : score;
+        oi = lane < Count ? ids[bank * 1024 + (lane ^ stride)] : id;
+        bank ^= 1;
+      } else {
+        other = sycl::permute_group_by_xor(sg, score, stride);
+        oi = sycl::permute_group_by_xor(sg, id, stride);
+      }
+      const bool low = ((lane & size) == 0) == ((lane & stride) == 0);
+      const bool greater = score > other || (score == other && id < oi);
+      if (greater == low) {
+        score = other;
+        id = oi;
+      }
+    }
+  }
+  if (lane < Count) {
+    scores[bank * 1024 + lane] = score;
+    ids[bank * 1024 + lane] = id;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+  float winner = lane < 512 ? scores[bank * 1024 + Count - 1 - lane]
+                            : -std::numeric_limits<float>::infinity();
+  int32_t wi = lane < 512 ? ids[bank * 1024 + Count - 1 - lane] : -1;
+  item.barrier(sycl::access::fence_space::local_space);
+  if (lane < 512) {
+    scores[lane] = winner;
+    ids[lane] = wi;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+}
+
+template <int PageSize, bool Short, bool Bounded, bool Split>
 class SelectionPhase0;
+template <bool Bounded>
 class SelectionMerge;
 
-template <int PageSize>
+template <int PageSize, bool Short, bool Bounded, bool Split = false>
 sycl::event launch_selection_phase0(
     sycl::queue& queue,
     const half* q,
@@ -1208,16 +1631,20 @@ sycl::event launch_selection_phase0(
     int64_t cache_page_stride,
     int64_t cache_row_stride,
     int partitions,
-    int blocks_per_partition,
+    int captured_blocks_per_partition,
     sycl::event previous,
-    bool has_previous) {
+    bool has_previous,
+    const float* raw_sb = nullptr,
+    const int32_t* raw_ib = nullptr) {
   return queue.submit([&](sycl::handler& cgh) {
     if (has_previous) cgh.depends_on(previous);
     sycl::local_accessor<half, 1> query_shared(
         sycl::range<1>(kIndexHeads * kIndexDim), cgh);
-    sycl::local_accessor<float, 1> scores(sycl::range<1>(kSortSlots), cgh);
-    sycl::local_accessor<int32_t, 1> indices(sycl::range<1>(kSortSlots), cgh);
-    cgh.parallel_for<SelectionPhase0<PageSize>>(
+    sycl::local_accessor<float, 1> scores(
+        sycl::range<1>(Split ? 2 * kSortSlots : kSortSlots), cgh);
+    sycl::local_accessor<int32_t, 1> indices(
+        sycl::range<1>(Split ? 2 * kSortSlots : kSortSlots), cgh);
+    cgh.parallel_for<SelectionPhase0<PageSize, Short, Bounded, Split>>(
         sycl::nd_range<1>(
             sycl::range<1>(rows * partitions * kSelectionWg),
             sycl::range<1>(kSelectionWg)),
@@ -1236,6 +1663,19 @@ sycl::event launch_selection_phase0(
               sycl::max(positions[row] + 1, int64_t(0));
           const int64_t visible_blocks =
               sycl::min(visible_tokens, static_cast<int64_t>(seq)) / 4;
+          int blocks_per_partition = captured_blocks_per_partition;
+          if constexpr (Bounded && !Short) {
+            if (partitions == 32) {
+              const int64_t scanned = sycl::min(
+                  visible_blocks,
+                  int64_t(partitions) * captured_blocks_per_partition);
+              const int per_group =
+                  int((scanned + partitions - 1) / partitions);
+              blocks_per_partition = sycl::max(
+                  kTopBlocks,
+                  ((per_group + kTopBlocks - 1) / kTopBlocks) * kTopBlocks);
+            }
+          }
           // All lanes agree on row/partition. An entirely invisible partition
           // contributes the same sentinels as the full score/sort path.
           if (partitions > 1 &&
@@ -1258,98 +1698,171 @@ sycl::event launch_selection_phase0(
             indices[s] = -1;
           }
           item.barrier(sycl::access::fence_space::local_space);
-          for (int base = 0; base < blocks_per_partition; base += kTopBlocks) {
-            for (int b = subgroup; b < kTopBlocks;
-                 b += kSelectionWg / kSelectionSg) {
-              const int64_t logical =
-                  static_cast<int64_t>(partition) * blocks_per_partition +
-                  base + b;
-              const int64_t logical_page = logical / PageSize;
-              bool valid = valid_req && logical < visible_blocks &&
-                           logical_page < table_stride;
-              int physical = -1;
-              if (valid) {
-                physical = table[request * table_stride + logical_page];
-                valid = physical >= 0 && physical < physical_pages;
+          const int active_blocks =
+              Bounded ? int(sycl::min(
+                            int64_t(blocks_per_partition),
+                            sycl::max(
+                                visible_blocks -
+                                    int64_t(partition) * blocks_per_partition,
+                                int64_t(0))))
+                      : blocks_per_partition;
+          for (int base = 0; base < active_blocks; base += kTopBlocks) {
+            const bool first_chunk = base == 0;
+            int first_sort_size = kTopBlocks;
+            if constexpr (Short) {
+              const int64_t available = sycl::max(
+                  visible_blocks -
+                      static_cast<int64_t>(partition) * blocks_per_partition,
+                  int64_t(0));
+              first_sort_size = 2;
+              while (first_sort_size <
+                     sycl::min(
+                         available,
+                         int64_t(sycl::min(blocks_per_partition, kTopBlocks))))
+                first_sort_size <<= 1;
+            }
+            int score_count = kTopBlocks;
+            if constexpr (Short) {
+              const int64_t available = sycl::max(
+                  visible_blocks -
+                      static_cast<int64_t>(partition) * blocks_per_partition -
+                      base,
+                  int64_t(0));
+              score_count = int(sycl::min(
+                  available,
+                  int64_t(sycl::min(blocks_per_partition - base, kTopBlocks))));
+              if (lane >= score_count && lane < kTopBlocks) {
+                scores[kTopBlocks + lane] =
+                    -std::numeric_limits<float>::infinity();
+                indices[kTopBlocks + lane] = -1;
               }
-              const int64_t cache_offset =
-                  valid ? static_cast<int64_t>(physical) * cache_page_stride +
-                              (logical % PageSize) * cache_row_stride
-                        : 0;
-              float dot[4] = {};
+            }
+            if constexpr (Split) {
+              // Each consumer owns one scratch row. Chunk 0/1 are read
+              // before this row is overwritten by its final sorted leaf.
+              for (int b = lane; b < score_count; b += kSelectionWg) {
+                const int64_t logical =
+                    int64_t(partition) * blocks_per_partition + base + b;
+                float score = -std::numeric_limits<float>::infinity();
+                if (logical < visible_blocks) {
+                  const int chunk = (base + b) / 512,
+                            from = partition * 512 + b;
+                  if (chunk == 0)
+                    score = scores_a[from];
+                  else if (chunk == 1)
+                    score = sycl::bit_cast<float>(indices_a[from]);
+                  else if (chunk == 2)
+                    score = raw_sb[from];
+                  else
+                    score = sycl::bit_cast<float>(raw_ib[from]);
+                }
+                scores[512 + b] = score;
+                indices[512 + b] = score >= 0 ? int32_t(logical) : -1;
+              }
+            } else {
+              for (int b = subgroup; b < score_count;
+                   b += kSelectionWg / kSelectionSg) {
+                const int64_t logical =
+                    static_cast<int64_t>(partition) * blocks_per_partition +
+                    base + b;
+                const int64_t logical_page = logical / PageSize;
+                bool valid =
+                    valid_req && logical < visible_blocks &&
+                    (!Short || logical < static_cast<int64_t>(partition + 1) *
+                                             blocks_per_partition) &&
+                    logical_page < table_stride;
+                int physical = -1;
+                if (valid) {
+                  physical = table[request * table_stride + logical_page];
+                  valid = physical >= 0 && physical < physical_pages;
+                }
+                const int64_t cache_offset =
+                    valid ? static_cast<int64_t>(physical) * cache_page_stride +
+                                (logical % PageSize) * cache_row_stride
+                          : 0;
+                float dot[4] = {};
 #pragma unroll
-              for (int frag = 0; frag < 4; ++frag) {
-                const int dim = dim_lane + frag * kSelectionSg;
-                const float key =
-                    valid ? static_cast<float>(cache[cache_offset + dim])
-                          : 0.0f;
+                for (int frag = 0; frag < 4; ++frag) {
+                  const int dim = dim_lane + frag * kSelectionSg;
+                  const float key =
+                      valid ? static_cast<float>(cache[cache_offset + dim])
+                            : 0.0f;
+#pragma unroll
+                  for (int h = 0; h < kIndexHeads; ++h) {
+                    dot[h] +=
+                        static_cast<float>(query_shared[h * kIndexDim + dim]) *
+                        key;
+                  }
+                }
+                float score = 0.0f;
 #pragma unroll
                 for (int h = 0; h < kIndexHeads; ++h) {
-                  dot[h] +=
-                      static_cast<float>(query_shared[h * kIndexDim + dim]) *
-                      key;
+                  const float value = sycl::reduce_over_group(
+                      item.get_sub_group(), dot[h], sycl::plus<float>());
+                  score += sycl::fmax(value, 0.0f);
                 }
-              }
-              float score = 0.0f;
-#pragma unroll
-              for (int h = 0; h < kIndexHeads; ++h) {
-                const float value = sycl::reduce_over_group(
-                    item.get_sub_group(), dot[h], sycl::plus<float>());
-                score += sycl::fmax(value, 0.0f);
-              }
-              if (dim_lane == 0) {
-                scores[kTopBlocks + b] =
-                    valid ? score * 0.08838834764831845f
-                          : -std::numeric_limits<float>::infinity();
-                indices[kTopBlocks + b] =
-                    valid ? static_cast<int32_t>(logical) : -1;
+                if (dim_lane == 0) {
+                  scores[kTopBlocks + b] =
+                      valid ? score * 0.08838834764831845f
+                            : -std::numeric_limits<float>::infinity();
+                  indices[kTopBlocks + b] =
+                      valid ? static_cast<int32_t>(logical) : -1;
+                }
               }
             }
             item.barrier(sycl::access::fence_space::local_space);
             // Sort ascending score, descending index. Reverse the high half
             // for final descending score and deterministic low-index ties.
-            const bool first_chunk = base == 0;
             const int sort_offset = first_chunk ? kTopBlocks : 0;
-            const int sort_size = first_chunk ? kTopBlocks : kSortSlots;
-            for (int size = 2; size <= sort_size; size <<= 1) {
-              for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                for (int logical_left = lane; logical_left < sort_size;
-                     logical_left += kSelectionWg) {
-                  const int left = logical_left + sort_offset;
-                  const int right = (logical_left ^ stride) + sort_offset;
-                  if (right <= left) {
-                    continue;
+            const int sort_size = first_chunk ? first_sort_size : kSortSlots;
+            if constexpr (Split) {
+              if (first_chunk)
+                hybrid_float_top<512>(item, scores, indices, 512);
+              else
+                hybrid_float_top<1024>(item, scores, indices, 0);
+            } else {
+              for (int size = 2; size <= sort_size; size <<= 1) {
+                for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                  for (int logical_left = lane; logical_left < sort_size;
+                       logical_left += kSelectionWg) {
+                    const int left = logical_left + sort_offset;
+                    const int right = (logical_left ^ stride) + sort_offset;
+                    if (right <= left) {
+                      continue;
+                    }
+                    const float a = scores[left], bscore = scores[right];
+                    const int32_t ai = indices[left], bi = indices[right];
+                    const bool ascending = (logical_left & size) == 0;
+                    const bool swap =
+                        ascending ? (a > bscore || (a == bscore && ai < bi))
+                                  : (a < bscore || (a == bscore && ai > bi));
+                    if (swap) {
+                      scores[left] = bscore;
+                      scores[right] = a;
+                      indices[left] = bi;
+                      indices[right] = ai;
+                    }
                   }
-                  const float a = scores[left], bscore = scores[right];
-                  const int32_t ai = indices[left], bi = indices[right];
-                  const bool ascending = (logical_left & size) == 0;
-                  const bool swap =
-                      ascending ? (a > bscore || (a == bscore && ai < bi))
-                                : (a < bscore || (a == bscore && ai > bi));
-                  if (swap) {
-                    scores[left] = bscore;
-                    scores[right] = a;
-                    indices[left] = bi;
-                    indices[right] = ai;
-                  }
+                  item.barrier(sycl::access::fence_space::local_space);
                 }
-                item.barrier(sycl::access::fence_space::local_space);
               }
+              float winning_score = -std::numeric_limits<float>::infinity();
+              int32_t winning_index = -1;
+              if (lane < kTopBlocks && lane < sort_size) {
+                const int from = sort_offset + sort_size - 1 - lane;
+                winning_score = scores[from];
+                winning_index = indices[from];
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+              if (lane < kTopBlocks) {
+                scores[lane] = winning_score;
+                indices[lane] = winning_index;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
             }
-            float winning_score = -std::numeric_limits<float>::infinity();
-            int32_t winning_index = -1;
-            if (lane < kTopBlocks) {
-              const int from = kSortSlots - 1 - lane;
-              winning_score = scores[from];
-              winning_index = indices[from];
-            }
-            item.barrier(sycl::access::fence_space::local_space);
-            if (lane < kTopBlocks) {
-              scores[lane] = winning_score;
-              indices[lane] = winning_index;
-            }
-            item.barrier(sycl::access::fence_space::local_space);
           }
+          if constexpr (Split)
+            item.barrier(sycl::access::fence_space::global_and_local);
           if (lane >= kTopBlocks) {
             return;
           }
@@ -1388,6 +1901,7 @@ sycl::event launch_selection_phase0(
   });
 }
 
+template <bool Bounded>
 sycl::event launch_selection_merge(
     sycl::queue& queue,
     sycl::event previous,
@@ -1401,12 +1915,14 @@ sycl::event launch_selection_merge(
     int32_t* out,
     int rows,
     int requests,
-    int pairs) {
+    int pairs,
+    int captured_blocks_per_partition,
+    int source_partitions) {
   return queue.submit([&](sycl::handler& cgh) {
     cgh.depends_on(previous);
     sycl::local_accessor<float, 1> scores(sycl::range<1>(kSortSlots), cgh);
     sycl::local_accessor<int32_t, 1> indices(sycl::range<1>(kSortSlots), cgh);
-    cgh.parallel_for<SelectionMerge>(
+    cgh.parallel_for<SelectionMerge<Bounded>>(
         sycl::nd_range<1>(
             sycl::range<1>(rows * pairs * kMergeWg), sycl::range<1>(kMergeWg)),
         [=](sycl::nd_item<1> item) {
@@ -1416,22 +1932,49 @@ sycl::event launch_selection_merge(
           const int base = row * kWorkspaceRowStride + pair * kSortSlots;
           scores[lane] = src_scores[base + lane];
           indices[lane] = src_indices[base + lane];
-          scores[kSortSlots - 1 - lane] = src_scores[base + kTopBlocks + lane];
-          indices[kSortSlots - 1 - lane] =
-              src_indices[base + kTopBlocks + lane];
-          item.barrier(sycl::access::fence_space::local_space);
-          for (int stride = kTopBlocks; stride > 0; stride >>= 1) {
-            const int left = (lane / stride) * (2 * stride) + lane % stride;
-            const int right = left + stride;
-            const float a = scores[left], b = scores[right];
-            const int32_t ai = indices[left], bi = indices[right];
-            if (a < b || (a == b && ai > bi)) {
-              scores[left] = b;
-              scores[right] = a;
-              indices[left] = bi;
-              indices[right] = ai;
+          bool right_empty = false;
+          if constexpr (Bounded) {
+            const int req = reqs[row];
+            const int64_t seq =
+                req >= 0 && req < requests
+                    ? sycl::max(int64_t(seq_lengths[req]), int64_t(0))
+                    : 0;
+            const int64_t visible = sycl::max(positions[row] + 1, int64_t(0));
+            const int64_t blocks = sycl::min(visible, seq) / 4;
+            int blocks_per_partition = captured_blocks_per_partition;
+            const int partitions = 2 * pairs * source_partitions;
+            if (partitions == 32) {
+              const int64_t scanned = sycl::min(
+                  blocks, int64_t(partitions) * captured_blocks_per_partition);
+              const int per_group =
+                  int((scanned + partitions - 1) / partitions);
+              blocks_per_partition = sycl::max(
+                  kTopBlocks,
+                  ((per_group + kTopBlocks - 1) / kTopBlocks) * kTopBlocks);
             }
+            right_empty = int64_t(pair * 2 + 1) * source_partitions *
+                              blocks_per_partition >=
+                          blocks;
+          }
+          if (!right_empty) {
+            scores[kSortSlots - 1 - lane] =
+                src_scores[base + kTopBlocks + lane];
+            indices[kSortSlots - 1 - lane] =
+                src_indices[base + kTopBlocks + lane];
             item.barrier(sycl::access::fence_space::local_space);
+            for (int stride = kTopBlocks; stride > 0; stride >>= 1) {
+              const int left = (lane / stride) * (2 * stride) + lane % stride;
+              const int right = left + stride;
+              const float a = scores[left], b = scores[right];
+              const int32_t ai = indices[left], bi = indices[right];
+              if (a < b || (a == b && ai > bi)) {
+                scores[left] = b;
+                scores[right] = a;
+                indices[left] = bi;
+                indices[right] = ai;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+            }
           }
           if (pairs == 1) {
             const int req = reqs[row];
@@ -1594,11 +2137,25 @@ at::Tensor select_paged_tokens_v2(
        &scores_b,
        &indices_b},
       stream);
-  const int partitions = max_seq_len >= 4096 ? kSelectionPartitions : 1;
+  // Small captures use four groups. For larger M1 captures the fixed 32
+  // groups partition the live visible range on device, keeping the same
+  // scratch ABI and graph topology. Every per-block FP32 score and the total
+  // score/index ordering are unchanged. M>1 keeps its original partitioning.
+  const bool short_selection = q.size(0) == 1 && max_seq_len <= 2048;
+  const bool bounded = q.size(0) == 1;
+  const int partitions =
+      short_selection ? 4 : (max_seq_len >= 4096 ? kSelectionPartitions : 1);
   const int max_blocks = static_cast<int>((max_seq_len + 3) / 4);
   const int per_partition = (max_blocks + partitions - 1) / partitions;
-  const int blocks_per_partition =
+  int blocks_per_partition =
       ((per_partition + kTopBlocks - 1) / kTopBlocks) * kTopBlocks;
+  if (short_selection) {
+    blocks_per_partition = 1;
+    while (blocks_per_partition < per_partition)
+      blocks_per_partition <<= 1;
+  }
+  const bool split_selection =
+      bounded && partitions == 32 && blocks_per_partition <= 2048;
   const auto* query_ptr = static_cast<const half*>(q.data_ptr());
   const auto* cache_ptr =
       static_cast<const half*>(compressed_key_cache.data_ptr());
@@ -1621,53 +2178,145 @@ at::Tensor select_paged_tokens_v2(
     const auto* chunk_reqs = req_ptr + offset;
     const auto* chunk_positions = pos_ptr + offset;
     auto* chunk_out = out_ptr + static_cast<int64_t>(offset) * kSlots;
-    auto phase = compressed_page_size == 64
-                     ? launch_selection_phase0<64>(
-                           queue,
-                           chunk_q,
-                           cache_ptr,
-                           table_ptr,
-                           chunk_reqs,
-                           chunk_positions,
-                           seq_ptr,
-                           chunk_out,
-                           sa,
-                           ia,
-                           rows,
-                           page_table.size(0),
-                           page_table.size(1),
-                           compressed_key_cache.size(0),
-                           compressed_key_cache.stride(0),
-                           compressed_key_cache.stride(1),
-                           partitions,
-                           blocks_per_partition,
-                           previous,
-                           has_previous)
-                     : launch_selection_phase0<128>(
-                           queue,
-                           chunk_q,
-                           cache_ptr,
-                           table_ptr,
-                           chunk_reqs,
-                           chunk_positions,
-                           seq_ptr,
-                           chunk_out,
-                           sa,
-                           ia,
-                           rows,
-                           page_table.size(0),
-                           page_table.size(1),
-                           compressed_key_cache.size(0),
-                           compressed_key_cache.stride(0),
-                           compressed_key_cache.stride(1),
-                           partitions,
-                           blocks_per_partition,
-                           previous,
-                           has_previous);
-    if (partitions > 1) {
+    auto submit_phase0 = [&]<bool Short, bool Bounded>() {
+      // Four existing [32,512] arrays hold up to 65536 raw scores.
+      // M>1, unbounded selection and larger captures retain the old path.
+      if constexpr (Bounded && !Short) {
+        if (split_selection) {
+          auto split = [&]<int Page>() {
+            auto scored = launch_selection_split_score<Page>(
+                queue,
+                chunk_q,
+                cache_ptr,
+                table_ptr,
+                chunk_reqs,
+                chunk_positions,
+                seq_ptr,
+                sa,
+                ia,
+                sb,
+                ib,
+                page_table.size(0),
+                page_table.size(1),
+                compressed_key_cache.size(0),
+                compressed_key_cache.stride(0),
+                compressed_key_cache.stride(1),
+                blocks_per_partition,
+                previous,
+                has_previous);
+            return launch_selection_phase0<Page, false, true, true>(
+                queue,
+                chunk_q,
+                cache_ptr,
+                table_ptr,
+                chunk_reqs,
+                chunk_positions,
+                seq_ptr,
+                chunk_out,
+                sa,
+                ia,
+                rows,
+                page_table.size(0),
+                page_table.size(1),
+                compressed_key_cache.size(0),
+                compressed_key_cache.stride(0),
+                compressed_key_cache.stride(1),
+                partitions,
+                blocks_per_partition,
+                scored,
+                true,
+                sb,
+                ib);
+          };
+          return compressed_page_size == 64 ? split.template operator()<64>()
+                                            : split.template operator()<128>();
+        }
+      }
+      return compressed_page_size == 64
+                 ? launch_selection_phase0<64, Short, Bounded>(
+                       queue,
+                       chunk_q,
+                       cache_ptr,
+                       table_ptr,
+                       chunk_reqs,
+                       chunk_positions,
+                       seq_ptr,
+                       chunk_out,
+                       sa,
+                       ia,
+                       rows,
+                       page_table.size(0),
+                       page_table.size(1),
+                       compressed_key_cache.size(0),
+                       compressed_key_cache.stride(0),
+                       compressed_key_cache.stride(1),
+                       partitions,
+                       blocks_per_partition,
+                       previous,
+                       has_previous)
+                 : launch_selection_phase0<128, Short, Bounded>(
+                       queue,
+                       chunk_q,
+                       cache_ptr,
+                       table_ptr,
+                       chunk_reqs,
+                       chunk_positions,
+                       seq_ptr,
+                       chunk_out,
+                       sa,
+                       ia,
+                       rows,
+                       page_table.size(0),
+                       page_table.size(1),
+                       compressed_key_cache.size(0),
+                       compressed_key_cache.stride(0),
+                       compressed_key_cache.stride(1),
+                       partitions,
+                       blocks_per_partition,
+                       previous,
+                       has_previous);
+    };
+    auto phase = short_selection
+                     ? submit_phase0.template operator()<true, true>()
+                 : (bounded && q.size(0) == 1)
+                     ? submit_phase0.template operator()<false, true>()
+                     : submit_phase0.template operator()<false, false>();
+    if (split_selection) {
+      auto first = launch_selection_fold<4, false>(
+          queue,
+          phase,
+          sa,
+          ia,
+          sb,
+          ib,
+          chunk_reqs,
+          chunk_positions,
+          seq_ptr,
+          chunk_out,
+          page_table.size(0),
+          8,
+          blocks_per_partition);
+      phase = launch_selection_fold<8, true>(
+          queue,
+          first,
+          sb,
+          ib,
+          sa,
+          ia,
+          chunk_reqs,
+          chunk_positions,
+          seq_ptr,
+          chunk_out,
+          page_table.size(0),
+          1,
+          blocks_per_partition);
+    } else if (partitions > 1) {
       bool source_a = true;
       for (int pairs = partitions / 2; pairs >= 1; pairs /= 2) {
-        phase = source_a ? launch_selection_merge(
+        auto submit_merge = bounded && q.size(0) == 1
+                                ? launch_selection_merge<true>
+                                : launch_selection_merge<false>;
+        phase = source_a ? submit_merge(
                                queue,
                                phase,
                                sa,
@@ -1680,8 +2329,10 @@ at::Tensor select_paged_tokens_v2(
                                chunk_out,
                                rows,
                                page_table.size(0),
-                               pairs)
-                         : launch_selection_merge(
+                               pairs,
+                               blocks_per_partition,
+                               partitions / (2 * pairs))
+                         : submit_merge(
                                queue,
                                phase,
                                sb,
@@ -1694,7 +2345,9 @@ at::Tensor select_paged_tokens_v2(
                                chunk_out,
                                rows,
                                page_table.size(0),
-                               pairs);
+                               pairs,
+                               blocks_per_partition,
+                               partitions / (2 * pairs));
         source_a = !source_a;
       }
     }

@@ -22,7 +22,7 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 | PLE | 13个 `ple_*` dispatcher：NGram、embedding、norm、score/gate、融合 norm、residual 和 decode/prefill/spec short-conv。trusted 元数据只接受生产者证明，不把普通调用伪装 trusted。 |
 | GDN | `gdn_decode_sycl`、`gdn_spec_v2_sycl`、`gdn_norm_gate_sycl`、`gdn_norm_int4_sycl`；`qwen38_gdn.py` 保留模型侧参数顺序。TP4/TP8 sequential 几何；不宣告未实现的 interleaved 布局。 |
 | MoE | `qwen38_moe_sycl` dispatcher/classes、同一 DSO 的 direct workspace；`qwen38_moe.py` 提供 compact80/160 tuple与prefill DOWN。router是Q4_0，routed权重是signed-S4，不能混淆。 |
-| QSA | direct Pybind 的 compression、selection、token-split attention、QKV/norm/RoPE、cache-store/M1 transaction；`qwen38_qsa.py` 保留旧 positional ABI并传真实 host max_seq_len。M≤4096，C++分块复用显式 scratch。BMG G31、localQ6、M≥128 的 FP16 prefill 默认采用三头 QK-DPAS，P/PV仍FP32，空tile跳过；小M和不支持布局保持旧后端，可用 `QWEN38_QSA_PREFILL_QK_DPAS=0` 回切。 |
+| QSA | direct Pybind 的 compression、selection、token-split attention、QKV/norm/RoPE、cache-store/M1 transaction；`qwen38_qsa.py` 保留旧 positional ABI并传真实 host max_seq_len。M1 selection的4096–256000 capture复用四块原scratch并行FP32打分，以SG32固定网络排序，再按32→8→1归并；page64/128共用，graph拓扑固定，M>1保持原路径。M≤4096，C++分块复用显式 scratch。BMG G31、localQ6、M≥128 的 FP16 prefill 默认采用三头 QK-DPAS，P/PV仍FP32，空tile跳过；小M和不支持布局保持旧后端，可用 `QWEN38_QSA_PREFILL_QK_DPAS=0` 回切。 |
 | Host preflight | 私有 Pybind `tensors_disjoint_host` 检查实际地址与带 pitch 的内存行；`TensorBindingSnapshotV1` 批量核对活动 tensor 绑定。均无设备提交。Python 调用方必须先过滤自定义 tensor/Torch modes；inference 内容 reload 仍需显式清除缓存。 |
 | GDN M1 host transaction | 私有 `GDNM1WorkspaceDirectV1` 合并输入 INT4 投影、GDN core、norm+输出 INT4 的主机检查/提交，复用原三个设备实现，不是单设备 kernel。仅 TP4/TP8 FP16 M1 sequential；其余在提交前返回 None。活动参数、别名与 stream 检查保留，转换失败清除旧绑定见证，reload 调用 invalidate。 |
 | GDN speculative host transaction | 私有 `GDNSpecWorkspaceDirectV1` 合并两次 INT4 输入投影、spec GDN、norm 和 INT4 输出投影的主机检查/提交，仍是多个设备 kernel。仅 TP4/TP8、FP16、单个 speculative 序列、M2–8、sequential；接受 padded state/token indices，并保留 FP32 A_log。Python 侧 sigmoid norm 仅允许原权重 FP16，其余提交前回退。实时绑定、alias、current-stream 与 reload 失效规则同 M1；scratch 分配全部成功后才发布，分配失败可重试。 |
@@ -42,8 +42,27 @@ Pybind direct Tensor ABI需要对应 CPython/Torch，不能标成abi3扩展。
 当作默认安装完成。完整模型 async/MTP、多模态、准确性和 E2E 仍以运行记录
 为准，代码/算子单测存在不代表整链验收。
 
+## Qwen3.8 M1 QSA attention 提前读取
+
+对齐的 FP16 M1 attention 在每个 SG32 worker 内提前读取两个选中 token。
+每个 head 的 dot、subgroup 归约、online softmax 和 partial 合并
+保持原有 FP32 运算顺序；无效 slot、缺页和越界 request 在读取 KV 前屏蔽。
+工作区仍为 `[M,H,43,258]`，M1 使用 33 个 live partial，
+每个 partial 覆盖 64 个选中 slot。未对齐指针和 M>1 保持原读取顺序。
+该实现适用于 TP4 INT4 的 6 heads 和 TP8 INT4/FP8 的 3 heads。
+
 ## Qwen3.8 TP8 INT4 attention 输出投影
+
 M1 `[1,768]` 到 `[1,2560]` 的 Q4_0 输出投影使用每个 SG16 两行、
 每个工作组一个 subgroup，保留原通用 kernel 的逐 lane FP32 FMA 链、
 signed scale、SG16 归约及未对齐 storage offset 契约。
 其余形状与 M>1 的工作组打包保持原配置。
+
+## Qwen3.8 M1 QSA 元数据及 partial 读取
+
+对齐的 M1 SG32 worker 在寄存器中批量保存其索引和物理页号，
+按原 token 顺序取用，并跳过最后一个有效物理 slot 后的无效尾部。
+任意位置的负索引、缺页、越界 request 仍按原契约屏蔽。
+默认 M1 合并使用 64 列 tile，提前读取四个 partial，保留逐列 FP32 累加顺序；
+显式 `VLLM_XPU_QWEN38_QSA_M1_MERGE_TILE` 覆盖和 M>1 保持原选择。
+没有增加 workspace、图节点或改变公共 ABI。

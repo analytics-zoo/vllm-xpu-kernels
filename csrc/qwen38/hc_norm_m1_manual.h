@@ -25,10 +25,9 @@ inline RoundedFeedback round_feedback(float value) {
     // Preserve the actual FP16 RNE boundary in integer bits. Do not replace
     // this feedback with float(half(value)): IGC can promote that to value.
     const uint32_t rounded = magnitude + 0xfffu + ((magnitude >> 13) & 1u);
-    const uint16_t half_bits = uint16_t(
-        ((bits >> 16) & 0x8000u) | ((rounded - 0x38000000u) >> 13));
-    const uint32_t feedback =
-        (bits & 0x80000000u) | (rounded & 0xffffe000u);
+    const uint16_t half_bits =
+        uint16_t(((bits >> 16) & 0x8000u) | ((rounded - 0x38000000u) >> 13));
+    const uint32_t feedback = (bits & 0x80000000u) | (rounded & 0xffffe000u);
     return {half_bits, sycl::bit_cast<float>(feedback)};
   }
   // Preserve the previous conversion for small values, overflow and NaNs;
@@ -40,6 +39,7 @@ inline RoundedFeedback round_feedback(float value) {
 }
 
 class NormM1ManualKernel;
+constexpr int kM1OutputTiles = kHidden / kLocal;
 
 // The existing HC entry point performs all shape/alias/stream preflights.
 // Its M=1 combine+norm dispatch is the only caller of this helper.
@@ -56,10 +56,13 @@ inline void launch(
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> partial(kLocal / kSubgroup + 1, cgh);
     cgh.parallel_for<NormM1ManualKernel>(
-        sycl::nd_range<1>(size_t(kStreams * kLocal), kLocal),
-        [=](sycl::nd_item<1> item)
-            [[sycl::reqd_sub_group_size(kSubgroup)]] {
-          const int branch = item.get_group_linear_id();
+        sycl::nd_range<1>(size_t(kStreams * kM1OutputTiles * kLocal), kLocal),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSubgroup)]] {
+          // Repeat the original reduction without changing its order. Each
+          // group owns one disjoint 512-column output tile; the additional
+          // groups expose parallelism in this otherwise four-group kernel.
+          const int branch = item.get_group_linear_id() / kM1OutputTiles;
+          const int tile = item.get_group_linear_id() % kM1OutputTiles;
           const int lane = item.get_local_linear_id();
           const auto sg = item.get_sub_group();
           const int subgroup = lane / kSubgroup;
@@ -77,7 +80,9 @@ inline void launch(
             const float h = float(hidden[offset + col]);
             const float b = float(block[col]);
             const auto rounded = round_feedback(h + b * injection_scale);
-            combined[offset + col] = sycl::bit_cast<half>(rounded.bits);
+            if (i == tile) {
+              combined[offset + col] = sycl::bit_cast<half>(rounded.bits);
+            }
             feedback[i] = rounded.value;
             sum_sq += rounded.value * rounded.value;
           }
@@ -94,7 +99,9 @@ inline void launch(
           for (int i = 0; i < kHidden / kLocal; ++i) {
             const int col = lane + i * kLocal;
             const float w = float(weight[offset + col]);
-            normed[offset + col] = half(feedback[i] * inv * (1.0f + w));
+            if (i == tile) {
+              normed[offset + col] = half(feedback[i] * inv * (1.0f + w));
+            }
           }
         });
   });
@@ -102,10 +109,11 @@ inline void launch(
 
 class NormSmallMManualKernel;
 
-// Deliberately leave the validated M1 launch/body above unchanged. All small-M
-// rows share one kernel and the same round_feedback/RNE boundary. The caller
-// retains live shape/stride/alias/stream/lifetime preflights. Unsupported M
-// returns false before submission; execution errors must propagate.
+// All small-M rows share one kernel and the same round_feedback/RNE boundary.
+// Keep their original launch geometry: they already expose multiple rows. The
+// caller retains live shape/stride/alias/stream/lifetime preflights.
+// Unsupported M returns false before submission; execution errors must
+// propagate.
 inline bool launch_small_m(
     sycl::queue& queue,
     const half* hidden,
@@ -122,8 +130,7 @@ inline bool launch_small_m(
     sycl::local_accessor<float, 1> partial(kLocal / kSubgroup + 1, cgh);
     cgh.parallel_for<NormSmallMManualKernel>(
         sycl::nd_range<1>(size_t(m * kStreams * kLocal), kLocal),
-        [=](sycl::nd_item<1> item)
-            [[sycl::reqd_sub_group_size(kSubgroup)]] {
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSubgroup)]] {
           const int group = item.get_group_linear_id();
           const int row = group / kStreams;
           const int branch = group % kStreams;
