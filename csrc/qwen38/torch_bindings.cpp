@@ -11,6 +11,7 @@
 #include "qwen38/gdn_sycl_workspace.h"
 #include "qwen38/hc_sycl_workspace.h"
 #include "qwen38/metadata_sycl.h"
+#include "qwen38/greedy_sycl.h"
 #include "qwen38/ngram.h"
 #include "qwen38/moe_sycl_workspace.h"
 #include "qwen38/ops.h"
@@ -89,6 +90,14 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("greedy_argmax_sycl_abi_version") = 1;
+  module.attr("greedy_argmax_sycl_tp_sizes") = pybind11::make_tuple(4, 8);
+  module.def(
+      "try_global_argmax_token_int32",
+      &vllm::qwen38::try_global_argmax_token_int32);
+  module.def("try_local_argmax_packet", &vllm::qwen38::try_local_argmax_packet);
+  module.def("try_global_argmax_token", &vllm::qwen38::try_global_argmax_token);
+
   namespace py = pybind11;
   module.def("direct_tensor_flags_host", &direct_tensor_flags_host);
   module.def("try_copy_metadata_out", &vllm::qwen38::try_copy_metadata_out);

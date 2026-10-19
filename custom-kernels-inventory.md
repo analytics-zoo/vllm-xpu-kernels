@@ -10,6 +10,7 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 | `q4_0_quantize` | XPU FP16/BF16 连续 `[N,K]`，K为128倍数；输出 unsigned nibble 的 int32 `[N,K/8]` 和有符号 FP16 scale。保持 GGML Q4_0 位值。 |
 | `int4_linear` | FP16 `[M,K]`、uint8 `[N,K/2]` 与 signed FP16 scale；M1按 FP32 dequant，M>1按 FP16 dequant 后 FP32 累加。M2–8 适配形状走 XMX，其余走普通 SYCL。 |
 | `int4_linear_fused2` | M1两个独立投影、两个 caller-owned 输出，一次提交。 |
+| 私有 greedy argmax | `try_local_argmax_packet` 接受单行FP16词表分片；`try_global_argmax_token` / `try_global_argmax_token_int32` 接受 `[4,64]` 或 `[8,64]` FP32运输包，分别输出int64/int32 token。保留NaN优先、低rank/低token同分及padding语义；`greedy_argmax_sycl_tp_sizes=(4,8)` 让调用方在提交前检查旧库能力，ABI1的旧八卡接口保留。 |
 | `qwen38_fp8.try_qwen38_fp8_linear` | 独立 `_qwen38_fp8_C` 的普通 SYCL-TLA W8A16 投影，FP16 activation、FP8 E4M3FN `[N,K]`、FP32 scalar scale；TP4/TP8 M1–8 原生宽度，包括 N12 和 K80 尾部。提交前拒绝不支持的布局/设备，提交后异常传播。 |
 | `qwen38_fp8.Workspace.try_run` | TP4/TP8 M1–8 的 router/top10、routed/shared gate+up、DOWN、归约；routed 使用 contiguous KN、shared 使用 NK，I80/I160 不填充。每 stream/shape scratch；活动权重每次传入，输出独立拥有。支持动态输入 FULL graph replay。 |
 | `qwen38_fp8.try_gdn_norm` | TP4/TP8 `[M,12/6,128]` FP16 激活，FP16/FP32 norm weight 按原精度读取，FP32 RMS norm 和 sigmoid/SiLU，FP16 输出；M1–4096。默认 GDN 输出链使用普通 SYCL norm，再交给现有最快 SYCL-TLA FP8 投影。 |

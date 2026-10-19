@@ -629,6 +629,7 @@ if(QWEN38_KERNELS_ENABLED)
     "csrc/qwen38/hc_sycl_workspace.cpp"
     "csrc/qwen38/hc_bindings.cpp"
     "csrc/qwen38/metadata_sycl.cpp"
+    "csrc/qwen38/greedy_sycl.cpp"
     "csrc/qwen38/ple_sycl.cpp"
     "csrc/qwen38/ple_bindings.cpp"
     "csrc/qwen38/gdn_sycl.cpp"
