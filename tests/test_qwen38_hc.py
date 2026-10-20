@@ -84,6 +84,159 @@ def prefill_hc():
     return torch.ops._qwen38_C
 
 
+@pytest.mark.parametrize("rows", [320, 336])
+@pytest.mark.parametrize("scale", [.0001, .2, 2.0])
+def test_dense_down_silu_fp32_reference_and_dynamic_replay(prefill_hc, rows,
+                                                         scale):
+    torch.manual_seed(3100 + rows)
+    x = (torch.randn(1, 20480) * scale).half().to("xpu")
+    weight = (torch.randn(rows, 20480) * .01).half().to("xpu")
+    count = 324 if rows == 336 else 320
+    output = torch.empty(1, count, dtype=torch.float16, device="xpu")
+    stream = torch.xpu.Stream()
+
+    def reference():
+        # Independent accumulation plus each required intermediate FP16 cast.
+        projected = (x.cpu().float() @ weight[:count].cpu().float().T).half()
+        low = F.silu((projected[:, :320] / 4).half().float()).half()
+        return torch.cat((low, projected[:, 320:]), dim=1)
+
+    stream.wait_stream(torch.xpu.current_stream())
+    with torch.xpu.stream(stream):
+        prefill_hc.hc_dense_down_silu(x, weight, output)
+    stream.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.stream(stream), torch.xpu.graph(graph, stream=stream):
+        prefill_hc.hc_dense_down_silu(x, weight, output)
+    for factor in (1., .5, -1.):
+        with torch.xpu.stream(stream):
+            x.mul_(factor)
+            weight.mul_(.75)
+            graph.replay()
+        stream.synchronize()
+        torch.testing.assert_close(output.cpu(), reference(), atol=1e-3,
+                                   rtol=4e-3)
+
+
+@pytest.mark.parametrize("invalid", ["rows", "alias", "alignment", "dtype"])
+def test_dense_down_silu_rejects_before_writing(prefill_hc, invalid):
+    x = torch.randn(1, 20480, dtype=torch.float16, device="xpu")
+    weight = torch.randn(336, 20480, dtype=torch.float16, device="xpu")
+    output = torch.full((1, 324), 19., dtype=x.dtype, device=x.device)
+    if invalid == "rows":
+        x = x.expand(2, -1).contiguous()
+    elif invalid == "alias":
+        output = x[:, :324]
+    elif invalid == "alignment":
+        x = torch.randn(20481, dtype=x.dtype, device=x.device)[1:].view(1, -1)
+    else:
+        weight = weight.bfloat16()
+    original = output.clone()
+    with pytest.raises(RuntimeError):
+        prefill_hc.hc_dense_down_silu(x, weight, output)
+    torch.testing.assert_close(output, original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("injection_stride", [4, 656])
+def test_dense_hc_math_and_materialized_fp16_residual(prefill_hc, m,
+                                                     injection_stride):
+    """H5120 keeps FP16 residual storage before the independent FP32 norm."""
+    torch.manual_seed(2210 + m)
+    x = torch.randn(m, 20480, device="xpu", dtype=torch.float16) * .2
+    block = torch.randn(m, 5120, device="xpu", dtype=torch.float16) * .2
+    injection = torch.randn(
+        m, injection_stride, device="xpu", dtype=torch.float16)[:, :4]
+    gamma = torch.randn(20480, device="xpu", dtype=torch.float16) * .03
+    combined, normed = torch.empty_like(x), torch.empty_like(x)
+    prefill_hc.hc_dense_combine_norm(x, block, injection, gamma, combined,
+                                    normed, 1e-6)
+    scale = 2 * torch.sigmoid(injection.cpu().float() / 4)
+    ref_combined = (x.cpu().float().reshape(m, 4, 5120) +
+                    block.cpu().float()[:, None] * scale[:, :, None]).half()
+    grouped = ref_combined.float()
+    ref_norm = ((grouped * torch.rsqrt(
+        grouped.square().mean(-1, keepdim=True) + 1e-6)).flatten(1) *
+                (1 + gamma.cpu().float())).half()
+    torch.testing.assert_close(
+        combined.cpu(), ref_combined.flatten(1), atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        normed.cpu(), ref_norm, atol=2e-3, rtol=2e-3)
+    prefill_hc.hc_dense_grouped_norm(combined, gamma, normed, 1e-6)
+    torch.testing.assert_close(
+        normed.cpu(), ref_norm, atol=2e-3, rtol=2e-3)
+    gate = torch.randn_like(x) * .3
+    mixed = torch.empty_like(block)
+    prefill_hc.hc_dense_gate_mix(normed, gate, mixed)
+    expected = (ref_norm.float().reshape(m, 4, 5120) * torch.sigmoid(
+        gate.cpu().float().reshape(m, 4, 5120))).mean(1).half()
+    torch.testing.assert_close(
+        mixed.cpu(), expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("m", [1, 4])
+def test_dense_hc_graph_uses_current_inputs_on_nondefault_stream(prefill_hc, m):
+    x = torch.randn(m, 20480, device="xpu", dtype=torch.float16) * .1
+    block = torch.randn(m, 5120, device="xpu", dtype=torch.float16) * .1
+    injection = torch.randn(m, 656, device="xpu", dtype=torch.float16)[:, :4]
+    weight = torch.randn(20480, device="xpu", dtype=torch.float16) * .02
+    combined, normed = torch.empty_like(x), torch.empty_like(x)
+    gate, mixed = torch.randn_like(x), torch.empty_like(block)
+    stream = torch.xpu.Stream()
+    stream.wait_stream(torch.xpu.current_stream())
+    with torch.xpu.stream(stream):
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            prefill_hc.hc_dense_combine_norm(x, block, injection, weight,
+                                            combined, normed, 1e-6)
+            prefill_hc.hc_dense_gate_mix(normed, gate, mixed)
+        for shift in [-.1, .2, -.3]:
+            x.add_(shift)
+            injection.add_(shift * 2)
+            gate.add_(shift)
+            graph.replay()
+            scale = 2 * torch.sigmoid(injection.cpu().float() / 4)
+            residual = (x.cpu().float().reshape(m, 4, 5120) +
+                        block.cpu().float()[:, None] * scale[:, :, None])
+            residual = residual.half().float()
+            reference = (residual * torch.rsqrt(
+                residual.square().mean(-1, keepdim=True) + 1e-6)).flatten(1)
+            reference = (reference * (1 + weight.cpu().float())).half().float()
+            reference = (reference.reshape(m, 4, 5120) * torch.sigmoid(
+                gate.cpu().float().reshape(m, 4, 5120))).mean(1).half()
+            torch.testing.assert_close(
+                mixed.cpu(), reference, atol=2e-3, rtol=2e-3)
+    torch.xpu.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize("invalid", ["input_alias", "output_alias", "eps",
+                                      "weight_dtype", "injection_stride"])
+def test_dense_hc_rejects_invalid_call_before_any_output_write(prefill_hc,
+                                                              invalid):
+    x = torch.randn(2, 20480, device="xpu", dtype=torch.float16)
+    block = torch.randn(2, 5120, device="xpu", dtype=torch.float16)
+    injection = torch.randn(2, 4, device="xpu", dtype=torch.float16)
+    weight = torch.zeros(20480, device="xpu", dtype=torch.float16)
+    combined, normed = torch.full_like(x, 77), torch.full_like(x, -55)
+    eps = 1e-6
+    if invalid == "input_alias":
+        combined = x
+    elif invalid == "output_alias":
+        normed = combined
+    elif invalid == "eps":
+        eps = float("nan")
+    elif invalid == "weight_dtype":
+        weight = weight.float()
+    else:
+        injection = injection[:1].expand(2, -1)
+    before = [v.clone() for v in (combined, normed)]
+    with pytest.raises(RuntimeError):
+        prefill_hc.hc_dense_combine_norm(x, block, injection, weight,
+                                        combined, normed, eps)
+    for actual, original in zip((combined, normed), before):
+        torch.testing.assert_close(actual, original, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("m", [9, 17, 128, 4096])
 @pytest.mark.parametrize("injection_stride", [4, 336])
 @pytest.mark.parametrize("norm_local", ["256", "512"])

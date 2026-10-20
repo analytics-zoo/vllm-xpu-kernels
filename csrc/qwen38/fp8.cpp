@@ -841,7 +841,10 @@ class Workspace {
 };
 }  // namespace
 
+void init_qwen4_dense_fp8(pybind11::module_& module);
+
 PYBIND11_MODULE(_qwen38_fp8_C, module) {
+  init_qwen4_dense_fp8(module);
   module.def("try_gdn_norm", &try_gdn_norm);
   module.def("try_qwen38_fp8_linear", &try_linear);
   pybind11::class_<Workspace>(module, "Workspace")

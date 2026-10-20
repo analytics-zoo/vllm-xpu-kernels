@@ -24,6 +24,67 @@ def ops():
     return importlib.import_module("vllm_xpu_kernels.qwen38_fp8")
 
 
+@pytest.mark.parametrize("n,k", [(14336, 5120), (5120, 7168), (8192, 5120),
+                                 (5120, 3072), (7168, 5120)])
+def test_dense_fp8_independent_math_and_graph(ops, n, k):
+    torch.manual_seed(n + k)
+    x = (torch.randn(1, k) * .2).half().xpu()
+    weight = (torch.randn(n, k) * .1).to(torch.float8_e4m3fn).xpu()
+    scale = torch.tensor([.37], device="xpu")
+    assert ops.try_qwen4_dense_fp8_linear(x, weight, scale) is not None
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = ops.try_qwen4_dense_fp8_linear(x, weight, scale)
+    for factor in (1., -.5, .25):
+        x.mul_(factor)
+        scale.mul_(.5)
+        graph.replay()
+        expected = (
+            x.cpu().float() @ weight.cpu().float().T * scale.cpu()).half()
+        torch.testing.assert_close(output.cpu(), expected, atol=.001, rtol=.003)
+
+
+def test_dense_fp8_pair_reads_distinct_scales_and_live_weights(ops):
+    torch.manual_seed(5531)
+    x = torch.randn(1, 5120, dtype=torch.float16, device="xpu") * .2
+    w0 = (torch.randn(8192, 5120, device="xpu") * .1).to(
+        torch.float8_e4m3fn)
+    w1 = (torch.randn(48, 5120, device="xpu") * .1).to(
+        torch.float8_e4m3fn)
+    s0, s1 = (torch.tensor([s], device="xpu") for s in (.031, .079))
+    ops.try_qwen4_dense_fp8_pair(x, w0, s0, w1, s1)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        outputs = ops.try_qwen4_dense_fp8_pair(x, w0, s0, w1, s1)
+    for factor in (1., -.5, .25):
+        x.mul_(factor)
+        w1.copy_((-w1.float()).to(w1.dtype))
+        graph.replay()
+        for output, weight, scale in zip(outputs, (w0, w1), (s0, s1)):
+            expected = (
+                x.cpu().float() @ weight.cpu().float().T * scale.cpu()).half()
+            torch.testing.assert_close(output.cpu(), expected, atol=.001,
+                                       rtol=.003)
+
+
+@pytest.mark.parametrize("invalid", ["batch", "shape", "dtype", "alignment"])
+def test_dense_fp8_unsupported_keeps_fallback(ops, invalid):
+    x = torch.zeros(1, 5120, device="xpu", dtype=torch.float16)
+    w = torch.zeros(7168, 5120, device="xpu", dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, device="xpu")
+    if invalid == "batch":
+        x = x.expand(2, -1).contiguous()
+    elif invalid == "shape":
+        w = w[:1024]
+    elif invalid == "dtype":
+        x = x.bfloat16()
+    else:
+        x = torch.zeros(5121, device="xpu", dtype=x.dtype)[1:].view(1, -1)
+    assert ops.try_qwen4_dense_fp8_linear(x, w, scale) is None
+
+
 @pytest.mark.parametrize("m", [1, 2, 3, 5, 8])
 @pytest.mark.parametrize(
     "n,k",
@@ -273,3 +334,17 @@ def test_m1_router_partial_alignment_preserves_fallback(ops, weights, offset):
     torch.testing.assert_close(
         actual.cpu(), reference(x, rw, cpu), atol=3e-4, rtol=0.01
     )
+
+
+@pytest.mark.parametrize("column", [0, 1, 2, 3])
+def test_dense_fp8_preserves_all_e4m3_encodings(ops, column):
+    raw = torch.zeros(8192, 5120, dtype=torch.uint8)
+    raw[:256, column] = torch.arange(256, dtype=torch.int64).to(torch.uint8)
+    weight = raw.view(torch.float8_e4m3fn)
+    x = torch.zeros(1, 5120, dtype=torch.float16)
+    x[0, column] = 1
+    actual = ops.try_qwen4_dense_fp8_linear(
+        x.xpu(), weight.xpu(), torch.ones(1, device="xpu"))
+    expected = weight[:, column].half().view(1, -1)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0,
+                               equal_nan=True)

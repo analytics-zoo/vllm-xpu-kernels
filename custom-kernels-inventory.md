@@ -12,6 +12,7 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 | `int4_linear_fused2` | M1两个独立投影、两个 caller-owned 输出，一次提交。 |
 | 私有 greedy argmax | `try_local_argmax_packet` 接受单行FP16词表分片；`try_global_argmax_token` / `try_global_argmax_token_int32` 接受 `[4,64]` 或 `[8,64]` FP32运输包，分别输出int64/int32 token。保留NaN优先、低rank/低token同分及padding语义；`greedy_argmax_sycl_tp_sizes=(4,8)` 让调用方在提交前检查旧库能力，ABI1的旧八卡接口保留。 |
 | `qwen38_fp8.try_qwen38_fp8_linear` | 独立 `_qwen38_fp8_C` 的普通 SYCL-TLA W8A16 投影，FP16 activation、FP8 E4M3FN `[N,K]`、FP32 scalar scale；TP4/TP8 M1–8 原生宽度，包括 N12 和 K80 尾部。提交前拒绝不支持的布局/设备，提交后异常传播。 |
+| `qwen38_fp8.try_qwen4_dense_fp8_linear` / `try_qwen4_dense_fp8_pair` | B70 TP2 dense Qwen4 的 M1 W8A16 SYCL-TLA 投影；复用既有 FP8 GEMV body，按实测 shape 选择 K 分片。pair 将 GDN `[8192,5120]` 与 `[48,5120]` 两个真实投影合为一次提交；两套 scalar scale 独立读取，无额外 padding。模型标记限制调用范围，旧 DSO 缺少可选入口时保留原路径。 |
 | `qwen38_fp8.Workspace.try_run` | TP4/TP8 M1–8 的 router/top10、routed/shared gate+up、DOWN、归约；routed 使用 contiguous KN、shared 使用 NK，I80/I160 不填充。每 stream/shape scratch；活动权重每次传入，输出独立拥有。支持动态输入 FULL graph replay。 |
 | `qwen38_fp8.try_gdn_norm` | TP4/TP8 `[M,12/6,128]` FP16 激活，FP16/FP32 norm weight 按原精度读取，FP32 RMS norm 和 sigmoid/SiLU，FP16 输出；M1–4096。默认 GDN 输出链使用普通 SYCL norm，再交给现有最快 SYCL-TLA FP8 投影。 |
 | `ngram_decode_ids` | int64 `[M]`、历史 `[M,2]`；uint64 wrapping hash＋signed remainder，输出 `[M,16]`。 |
@@ -20,6 +21,8 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 | 模块族 | 统一模块入口与 provider |
 | --- | --- |
 | HC | `_qwen38_C` 的 norm/combine/gate/down/up；`qwen38_hc_sycl` workspace 和同一 DSO 的 direct class。TP4维度10240/2560、低秩320，M1/M2–8。另有 `hc_prefill_grouped_norm`、`hc_prefill_combine`、`hc_prefill_combine_norm`、`hc_prefill_gate_mix` 四个 M9–4096 入口，只融合原FP16边界/FP32数学，不改变GEMM；caller-owned输出、alias预检和当前in-order stream生命周期保留。 |
+| Qwen4 dense HC | `hc_dense_grouped_norm`、`hc_dense_combine_norm`、`hc_dense_gate_mix` 覆盖 FP16 `[M,20480]`、4路各5120、M1–8；combine 接受带行间 padding 的 `[M,4]` injection。合并残差先舍入FP16，再做FP32 grouped Gemma RMSNorm；gate沿用FP32 sigmoid/mean。保留原FP16投影和SSM状态精度；旧DSO没有新入口时模型保持原回退。 |
+| Qwen4 dense HC down | `hc_dense_down_silu` 接受 TP2 的 FP16 `[320/336,20480]` 活动权重；M1 的 40 路 K 分片与 SiLU 融合。merged 只计算 320 个低秩和 4 个 injection 输出，跳过 12 行无效 padding；保留投影、除以 4 和 SiLU 的 FP16 舍入边界。支持当前 stream 和动态 graph replay，不缓存权重副本。 |
 | PLE | 13个 `ple_*` dispatcher：NGram、embedding、norm、score/gate、融合 norm、residual 和 decode/prefill/spec short-conv。trusted 元数据只接受生产者证明，不把普通调用伪装 trusted。 |
 | GDN | `gdn_decode_sycl`、`gdn_spec_v2_sycl`、`gdn_norm_gate_sycl`、`gdn_norm_int4_sycl`；`qwen38_gdn.py` 保留模型侧参数顺序。TP4/TP8 sequential 几何；不宣告未实现的 interleaved 布局。 |
 | MoE | `qwen38_moe_sycl` dispatcher/classes、同一 DSO 的 direct workspace；`qwen38_moe.py` 提供 compact80/160 tuple与prefill DOWN。router是Q4_0，routed权重是signed-S4，不能混淆。 |

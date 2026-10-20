@@ -602,6 +602,7 @@ if(QWEN38_KERNELS_ENABLED)
     ${VLLM_GPU_LANG}
     SOURCES
     "csrc/qwen38/fp8.cpp"
+    "csrc/qwen38/fp8_dense.cpp"
     COMPILE_FLAGS
     ${VLLM_GPU_COMPILE_FLAGS}
     ${VLLM_CUTLASS_FLAGS}
@@ -626,6 +627,7 @@ if(QWEN38_KERNELS_ENABLED)
     "csrc/qwen38/int4_small_m.cpp"
     "csrc/qwen38/ngram.cpp"
     "csrc/qwen38/hc_sycl.cpp"
+    "csrc/qwen38/hc_dense_sycl.cpp"
     "csrc/qwen38/hc_sycl_workspace.cpp"
     "csrc/qwen38/hc_bindings.cpp"
     "csrc/qwen38/metadata_sycl.cpp"
