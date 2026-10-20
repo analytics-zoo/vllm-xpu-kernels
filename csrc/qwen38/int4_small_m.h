@@ -25,4 +25,16 @@ bool launch_int4_small_m(
     int n,
     int k);
 
+// Dense Qwen4 BA: BMG G31, M1..8, N48/96, K5120; FP16 dequant.
+// Input and weight base addresses both require 64-byte alignment.
+bool launch_int4_dense_small_n(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const uint8_t* weight,
+    const sycl::half* scale,
+    sycl::half* output,
+    int m,
+    int n,
+    int k);
+
 }  // namespace vllm::qwen38

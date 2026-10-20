@@ -28,7 +28,7 @@ def _case(h: int, hv: int, m: int, spec: bool, packed: bool = True):
         "weight": (torch.randn(dim, 4) * 0.1).half(),
         "bias": (torch.randn(dim) * 0.01).half(),
         "a_log": (torch.randn(hv) * 0.05 + 0.3).float()
-        if spec
+        if spec or hv in (24, 48)
         else (torch.randn(hv) * 0.05 + 0.3).half(),
         "dt_bias": (torch.randn(hv) * 0.03).half(),
         "ba": (torch.randn(m, 2 * hv) * 0.08).half(),
@@ -175,7 +175,7 @@ def test_cpu_reference_null_block_is_zero():
     torch.testing.assert_close(state, case["ssm"], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("h,hv", [(4, 12), (2, 6)])
+@pytest.mark.parametrize("h,hv", [(16, 48), (8, 24), (4, 12), (2, 6)])
 @pytest.mark.parametrize("m", range(1, 9))
 def test_decode_golden(gdn_ops, h, hv, m):
     cpu = _case(h, hv, m, spec=False)
@@ -232,7 +232,7 @@ def test_decode_unaligned_storage_offset(gdn_ops):
         torch.testing.assert_close(gpu[key].cpu(), want, atol=0.006, rtol=0.006)
 
 
-@pytest.mark.parametrize("h,hv", [(4, 12), (2, 6)])
+@pytest.mark.parametrize("h,hv", [(16, 48), (8, 24), (4, 12), (2, 6)])
 def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv):
     cpu = _case(h, hv, 1, spec=False)
     gpu = _xpu(cpu)
@@ -266,7 +266,7 @@ def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv):
         cpu["conv"], cpu["ssm"] = expected[2:]
 
 
-@pytest.mark.parametrize("h,hv", [(4, 12), (2, 6)])
+@pytest.mark.parametrize("h,hv", [(16, 48), (8, 24), (4, 12), (2, 6)])
 @pytest.mark.parametrize("m", range(2, 9))
 @pytest.mark.parametrize("packed", [True, False])
 def test_spec_v2_golden(gdn_ops, h, hv, m, packed):

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "qwen38/int4_small_m.h"
+#include "xpu/gemv/xe_2/fp8_gemv.hpp"
 
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_xe.hpp>
@@ -159,6 +160,76 @@ void launch_kernel(
   });
 }
 
+template <int MP, int KS>
+struct Int4DenseSmallNKernel {
+  const sycl::half* input;
+  const uint8_t* weight;
+  const sycl::half* scale;
+  sycl::half* output;
+  int m;
+  int n;
+
+  [[sycl::reqd_sub_group_size(16)]] void
+  operator()(sycl::nd_item<1> item) const {
+#ifdef __SYCL_DEVICE_ONLY__
+    using namespace vllm::fp8_gemv;
+    using Mma = Dpas<MP>;
+    constexpr int K = 5120;
+    auto* partial = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[KS * MP * 16]>(item.get_group());
+    const int lane = item.get_local_linear_id() % 16;
+    const int split = item.get_local_linear_id() / 16;
+    const int row0 = item.get_group_linear_id() * 16;
+    typename Mma::C accum = {};
+    for (int kc = split * 64; kc < K; kc += KS * 64) {
+      u32x8 packed;
+      cute::intel::coord_t weight_coord = {kc / 8, row0};
+      cute::detail::XeSubgroup2DBlockLoadTranspose<4, 8, 16, 1>{}(
+          weight, K / 2, n, K / 2, weight_coord, &packed);
+      const float d = float(scale[int64_t(row0 + lane) * (K / 128) + kc / 128]);
+  #pragma unroll
+      for (int phase = 0; phase < 4; ++phase) {
+        typename Mma::A a;
+        cute::intel::coord_t input_coord = {kc + phase * 16, 0};
+        cute::detail::XeSubgroup2DBlockLoad<2, 16, MP, 1>{}(
+            input, K * 2, m, K * 2, input_coord, &a);
+        cute::intel::int8 b;
+  #pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+          const uint32_t value =
+              packed[phase * 2 + pair / 4] >> ((pair % 4) * 8);
+          sycl::vec<float, 2> decoded;
+          decoded[0] = float(int(value & 15) - 8) * d;
+          decoded[1] = float(int((value >> 4) & 15) - 8) * d;
+          const auto halves =
+              decoded.template convert<sycl::half, sycl::rounding_mode::rte>();
+          b[pair] = int(halves.template as<sycl::vec<uint32_t, 1>>()[0]);
+        }
+        Mma::mma(accum, a, b);
+      }
+    }
+  #pragma unroll
+    for (int row = 0; row < MP; ++row) {
+      partial[(split * MP + row) * 16 + lane] = vget<MP>(accum, row);
+    }
+    sycl::group_barrier(item.get_group());
+    if (split == 0) {
+  #pragma unroll
+      for (int row = 0; row < MP; ++row) {
+        if (row < m) {
+          float value = 0.f;
+  #pragma unroll
+          for (int part = 0; part < KS; ++part) {
+            value += partial[(part * MP + row) * 16 + lane];
+          }
+          output[int64_t(row) * n + row0 + lane] = sycl::half(value);
+        }
+      }
+    }
+#endif
+  }
+};
+
 }  // namespace
 
 bool launch_int4_small_m(
@@ -195,6 +266,48 @@ bool launch_int4_small_m(
     launch_kernel<4, kSplitsHigh>(queue, x, w, s, out, m, n, k);
   } else {
     launch_kernel<8, kSplitsHigh>(queue, x, w, s, out, m, n, k);
+  }
+  return true;
+}
+
+bool launch_int4_dense_small_n(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const uint8_t* weight,
+    const sycl::half* scale,
+    sycl::half* output,
+    int m,
+    int n,
+    int k) {
+  if (m < 1 || m > 8 || (n != 48 && n != 96) || k != 5120 || !input ||
+      !weight || !scale || !output ||
+      (reinterpret_cast<uintptr_t>(input) & 63u) != 0 ||
+      (reinterpret_cast<uintptr_t>(weight) & 63u) != 0) {
+    return false;
+  }
+  namespace sx = sycl::ext::oneapi::experimental;
+  static thread_local std::optional<sycl::device> cached_device;
+  static thread_local bool cached_supported = false;
+  const auto device = queue.get_device();
+  if (!cached_device || *cached_device != device) {
+    cached_supported = device.get_info<sx::info::device::architecture>() ==
+                       sx::architecture::intel_gpu_bmg_g31;
+    cached_device = device;
+  }
+  if (!cached_supported) return false;
+  auto launch = [&]<int MP, int KS>() {
+    queue.parallel_for(
+        sycl::nd_range<1>((n / 16) * KS * 16, KS * 16),
+        Int4DenseSmallNKernel<MP, KS>{input, weight, scale, output, m, n});
+  };
+  if (m == 1) {
+    launch.template operator()<1, 64>();
+  } else if (m == 2) {
+    launch.template operator()<2, 32>();
+  } else if (m <= 4) {
+    launch.template operator()<4, 32>();
+  } else {
+    launch.template operator()<8, 32>();
   }
   return true;
 }

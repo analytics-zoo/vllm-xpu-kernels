@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native Qwen3.8 GDN provider for the vLLM sequential ESIMD-call ABI.
 
-Only the supported TP4/TP8 sequential core and v2 speculative layout are
-exported. An older native DSO without a GDN schema must leave the matching
+Only the supported sequential core and v2 speculative layout are exported.
+An older native DSO without a GDN schema must leave the matching
 function absent so the vLLM adapter can choose its normal fallback before any
 state mutation. This module never imports the ESIMD package.
 """
@@ -31,8 +31,31 @@ def _native_op_registered(name: str) -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def supports_gdn_tp2() -> bool:
+    """Do not advertise TP2 when imported with a pre-TP2 native DSO."""
+    if not torch._C._jit_get_schemas_for_operator(
+        "_qwen38_C::gdn_tp2_sycl_supported"
+    ):
+        return False
+    return bool(torch.ops._qwen38_C.gdn_tp2_sycl_supported())
+
+
+@lru_cache(maxsize=1)
+def supports_gdn_tp1() -> bool:
+    if not torch._C._jit_get_schemas_for_operator(
+        "_qwen38_C::gdn_tp1_sycl_supported"
+    ):
+        return False
+    return bool(torch.ops._qwen38_C.gdn_tp1_sycl_supported())
+
+
 def supports_gdn_geometry(h: int, hv: int, k: int, v: int) -> bool:
-    """Return the only geometries implemented by the native GDN kernels."""
+    """Return the geometries implemented by the loaded native GDN library."""
+    if (h, hv, k, v) == (16, 48, 128, 128):
+        return supports_gdn_tp1()
+    if (h, hv, k, v) == (8, 24, 128, 128):
+        return supports_gdn_tp2()
     return (h, hv, k, v) in ((4, 12, 128, 128), (2, 6, 128, 128))
 
 
@@ -71,7 +94,7 @@ if _native_op_registered("gdn_decode_sycl"):
     ) -> torch.Tensor:
         if not supports_gdn_geometry(h, hv, k, v):
             raise ValueError(
-                "native sequential GDN supports only TP4/TP8 Qwen3.8"
+                "native sequential GDN does not support this head geometry"
             )
         if n != qkvz.shape[0]:
             raise ValueError("N must match the projected token count")

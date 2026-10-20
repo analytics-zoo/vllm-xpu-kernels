@@ -575,4 +575,30 @@ void int4_linear_fused2(
   dispatch_linear(stream.queue(), p);
 }
 
+bool int4_dense_ba_linear(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& scale,
+    torch::Tensor& output) {
+  check_input(input);
+  TORCH_CHECK(input.scalar_type() == at::kHalf, "dense input must be FP16");
+  check_projection(input, weight, scale, output);
+  if (input.size(0) > 8 || input.size(1) != 5120 ||
+      (weight.size(0) != 48 && weight.size(0) != 96)) {
+    return false;
+  }
+  const c10::OptionalDeviceGuard guard(input.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  record_stream({&input, &weight, &scale, &output}, stream);
+  return launch_int4_dense_small_n(
+      stream.queue(),
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      weight.data_ptr<uint8_t>(),
+      reinterpret_cast<const half*>(scale.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+      input.size(0),
+      weight.size(0),
+      input.size(1));
+}
+
 }  // namespace vllm::qwen38

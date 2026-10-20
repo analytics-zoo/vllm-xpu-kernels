@@ -46,6 +46,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor(b!) output1) -> ()");
   m.impl("int4_linear_fused2", torch::kXPU, &vllm::qwen38::int4_linear_fused2);
   m.def(
+      "int4_dense_ba_linear(Tensor input, Tensor weight, Tensor scale, "
+      "Tensor(a!) output) -> bool");
+  m.impl(
+      "int4_dense_ba_linear", torch::kXPU, &vllm::qwen38::int4_dense_ba_linear);
+  m.def(
       "ngram_decode_ids(Tensor input_ids, Tensor context, Tensor multipliers, "
       "Tensor(a!) output) -> ()");
   m.impl("ngram_decode_ids", torch::kXPU, &vllm::qwen38::ngram_decode_ids);
@@ -74,6 +79,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Negative, m) {
   m.impl("q4_0_quantize", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear_fused2", torch::CppFunction::makeFallthrough());
+  m.impl("int4_dense_ba_linear", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids_eos", torch::CppFunction::makeFallthrough());
   m.impl("ngram_host_lookup", torch::CppFunction::makeFallthrough());
@@ -83,6 +89,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
   m.impl("q4_0_quantize", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear_fused2", torch::CppFunction::makeFallthrough());
+  m.impl("int4_dense_ba_linear", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids_eos", torch::CppFunction::makeFallthrough());
   m.impl("ngram_host_lookup", torch::CppFunction::makeFallthrough());

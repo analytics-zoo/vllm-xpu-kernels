@@ -596,7 +596,9 @@ std::optional<torch::Tensor> try_gdn_norm(
     double eps,
     bool sigmoid) {
   if (!x.defined() || !x.is_xpu() || x.dim() != 3 || x.size(0) < 1 ||
-      x.size(0) > 4096 || (x.size(1) != 6 && x.size(1) != 12) ||
+      x.size(0) > 4096 ||
+      (x.size(1) != 6 && x.size(1) != 12 &&
+       !((x.size(1) == 24 || x.size(1) == 48) && x.size(0) <= 8)) ||
       x.size(2) != 128 || !weight.defined() ||
       !valid(x, x.device(), at::kHalf, 4) ||
       !valid(z, x.device(), at::kHalf, 4) || z.sizes() != x.sizes() ||
