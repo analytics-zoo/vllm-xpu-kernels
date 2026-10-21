@@ -416,4 +416,9 @@ def test_cpu_gdn_projection_checks_stream_before_fused_or_two_stage_path():
     body = source.split("void gdn_norm_int4_sycl(", 1)[1]
     # External SYCL queues can be unordered. The two-stage path otherwise
     # allows projection to read normalized before norm_gate has written it.
-    assert body.index("queue.is_in_order()") < body.index("if (hv == kHeads")
+    stream_check = body.index("queue.is_in_order()")
+    # The fused branch now selects by gate/weight/alignment, not a head-only
+    # condition. Both alternatives must remain below the stream preflight.
+    assert stream_check < body.index("if (sigmoid_gate")
+    assert stream_check < body.index("launch(")
+    assert stream_check < body.index("auto normalized = at::empty")

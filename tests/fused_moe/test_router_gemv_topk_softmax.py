@@ -188,7 +188,20 @@ def test_bf16_router_does_not_round_logits_through_fp16():
     w[:, 0] = torch.arange(1, 65, device=DEVICE).to(x.dtype)
     logits, weights, ids = _outputs(1, 64, 8)
     OPS.router_gemv_topk_softmax(x, w, logits, weights, ids, True)
-    _check_topk(logits, weights, ids, _reference(x, w, 8, True))
+    # Top-k after a full softmax may pick arbitrary zero-probability experts
+    # here: all except the maximum underflow. Check distinct logit picks and
+    # their normalized weights independently of those underflow ties.
+    ref_logits = torch.nn.functional.linear(x, w).float()
+    assert torch.isfinite(logits).all()
+    torch.testing.assert_close(logits, ref_logits, atol=0, rtol=0)
+    ref_values, ref_ids = torch.topk(ref_logits, 8, dim=-1)
+    order = ids.long().argsort(dim=-1)
+    ref_order = ref_ids.argsort(dim=-1)
+    assert torch.equal(ids.long().gather(-1, order),
+                       ref_ids.gather(-1, ref_order))
+    torch.testing.assert_close(weights.gather(-1, order),
+                               ref_values.softmax(-1).gather(-1, ref_order),
+                               atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -207,3 +220,90 @@ def test_router_rejects_more_than_sixteen_rows():
     logits, weights, ids = _outputs(17, 64, 8)
     with pytest.raises(RuntimeError, match="at most 16 tokens"):
         OPS.router_gemv_topk_softmax(x, w, logits, weights, ids, True)
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("invalid", ["cpu_input", "cpu_output",
+                                    "output_alias", "input_alias",
+                                    "expanded_input"])
+def test_router_rejects_unsafe_tensors(norm, invalid):
+    m, k, e, top_k = 2, 128, 16, 4
+    x = torch.zeros(m, k, device=DEVICE, dtype=torch.float16)
+    w = torch.ones(e, k, device=DEVICE, dtype=x.dtype)
+    logits, probs, ids = _outputs(m, e, top_k)
+    if invalid == "cpu_input":
+        w = w.cpu()
+    elif invalid == "cpu_output":
+        probs = probs.cpu()
+    elif invalid == "output_alias":
+        probs = logits.reshape(-1)[:probs.numel()].reshape_as(probs)
+    elif invalid == "input_alias":
+        logits = x.view(torch.float32).reshape(-1)[:m * e].reshape(m, e)
+    elif invalid == "expanded_input":
+        x = x[:1].expand_as(x)
+    with pytest.raises(RuntimeError, match="router_"):
+        if norm:
+            residual = torch.ones_like(x)
+            gamma = torch.ones(k, device=DEVICE, dtype=x.dtype)
+            OPS.router_resadd_norm_gemv_topk_softmax(
+                x, residual, gamma, EPS, w, logits, probs, ids,
+                torch.empty_like(x), torch.empty_like(x), True)
+        else:
+            OPS.router_gemv_topk_softmax(x, w, logits, probs, ids, True)
+
+
+@pytest.mark.parametrize("invalid", ["cross_pair", "partial_pair",
+                                    "output_alias", "cpu_gamma",
+                                    "routing_alias"])
+def test_router_norm_rejects_unsafe_inplace(invalid):
+    m, k, e, top_k = 2, 128, 16, 4
+    x = torch.zeros(m, k, device=DEVICE, dtype=torch.float16)
+    residual = torch.ones_like(x)
+    gamma = torch.ones(k, device=DEVICE, dtype=x.dtype)
+    w = torch.ones(e, k, device=DEVICE, dtype=x.dtype)
+    logits, probs, ids = _outputs(m, e, top_k)
+    normed, res_out = torch.empty_like(x), torch.empty_like(x)
+    if invalid == "cross_pair":
+        normed = residual
+    elif invalid == "partial_pair":
+        flat = torch.empty(x.numel() + 8, device=DEVICE, dtype=x.dtype)
+        x, normed = flat[:-8].reshape_as(x), flat[8:].reshape_as(x)
+    elif invalid == "output_alias":
+        res_out = normed
+    elif invalid == "cpu_gamma":
+        gamma = gamma.cpu()
+    else:
+        logits = residual.view(torch.float32).reshape(-1)[:m * e].reshape(m, e)
+    with pytest.raises(RuntimeError, match="router_"):
+        OPS.router_resadd_norm_gemv_topk_softmax(
+            x, residual, gamma, EPS, w, logits, probs, ids, normed, res_out,
+            True)
+
+
+
+@pytest.mark.parametrize("norm", [False, True])
+def test_router_resolves_negative_view(norm):
+    torch.manual_seed(487)
+    m, k, e, top_k = 2, 128, 16, 4
+    base = torch.randn(m, k, device=DEVICE, dtype=torch.float16) * 0.125
+    original = base.clone()
+    x = torch._neg_view(base)
+    w = torch.randn(e, k, device=DEVICE, dtype=x.dtype) * 0.02
+    logits, probs, ids = _outputs(m, e, top_k)
+    if norm:
+        residual = torch.zeros_like(base)
+        gamma = torch.zeros(k, device=DEVICE, dtype=x.dtype)
+        normed, res_out = torch.empty_like(base), torch.empty_like(base)
+        OPS.router_resadd_norm_gemv_topk_softmax(
+            x, residual, gamma, EPS, w, logits, probs, ids, normed, res_out,
+            True)
+        norm_ref, res_ref = _norm_reference(x.resolve_neg(), residual, gamma)
+        torch.testing.assert_close(normed, norm_ref, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(res_out, res_ref, atol=0, rtol=0)
+        reference = _reference(normed, w, top_k, True)
+    else:
+        OPS.router_gemv_topk_softmax(x, w, logits, probs, ids, True)
+        reference = _reference(x.resolve_neg(), w, top_k, True)
+    _check_topk(logits, probs, ids, reference)
+    assert x.is_neg()
+    torch.testing.assert_close(base, original, atol=0, rtol=0)

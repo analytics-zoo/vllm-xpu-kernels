@@ -96,3 +96,99 @@ def test_qkv_split_norm_rope(num_tokens, hq, hk, d, rotary_dim, gated, mrope,
     torch.testing.assert_close(k, rk, atol=tol, rtol=tol)
     if gated:
         torch.testing.assert_close(gate, rgate, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("invalid", ["cpu_positions", "cpu_weight",
+                                    "input_alias", "output_alias",
+                                    "gate_alias", "expanded_qkv",
+                                    "expanded_positions",
+                                    "head_overflow", "negative_section",
+                                    "large_section"])
+def test_qkv_split_norm_rope_rejects_unsafe_tensors(invalid):
+    # Every failure must happen before the first SYCL submission.
+    t, hq, hk, d, rotary = 2, 2, 1, 128, 64
+    qkv = torch.zeros(t, 2 * (hq + hk) * d, device=DEVICE,
+                      dtype=torch.float16)
+    pos = torch.zeros(3, t, device=DEVICE, dtype=torch.int64)
+    qw = torch.ones(d, device=DEVICE, dtype=qkv.dtype)
+    kw = torch.ones_like(qw)
+    cache = torch.ones(4, rotary, device=DEVICE, dtype=qkv.dtype)
+    q = torch.empty(t, hq * d, device=DEVICE, dtype=qkv.dtype)
+    k = torch.empty(t, hk * d, device=DEVICE, dtype=qkv.dtype)
+    gate = torch.empty_like(q)
+    section = [11, 11, 10]
+    if invalid == "head_overflow":
+        # Without the head capacity preflight, int64 width/output-numel
+        # products wrap to the small, otherwise valid tensors above.
+        hq = 2**56 + 2
+    elif invalid == "negative_section":
+        section = [-1, 22, 11]
+    elif invalid == "large_section":
+        section = [2**62, 2**62, 32]
+    elif invalid == "cpu_positions":
+        pos = pos.cpu()
+    elif invalid == "cpu_weight":
+        qw = qw.cpu()
+    elif invalid == "input_alias":
+        q = qkv.reshape(-1)[:q.numel()].reshape_as(q)
+    elif invalid == "output_alias":
+        k = q.reshape(-1)[:k.numel()].reshape_as(k)
+    elif invalid == "gate_alias":
+        gate = q
+    elif invalid == "expanded_qkv":
+        qkv = qkv[:1].expand_as(qkv)
+    elif invalid == "expanded_positions":
+        pos = pos[:1].expand_as(pos)
+    with pytest.raises(RuntimeError, match="qkv_split_norm_rope"):
+        torch.ops._xpu_C.qkv_split_norm_rope(
+            qkv, pos, qw, kw, cache, q, k, gate, hq, hk, d, rotary, 1e-6,
+            1.0, section, True)
+
+
+def test_qkv_split_norm_rope_accepts_disjoint_output_views():
+    # Sharing a Storage is safe when the actual output byte ranges differ.
+    t, hq, hk, d, rotary = 2, 2, 1, 128, 64
+    qkv = torch.randn(t, 2 * (hq + hk) * d, device=DEVICE,
+                      dtype=torch.float16)
+    pos = torch.zeros(t, device=DEVICE, dtype=torch.int64)
+    qw = torch.ones(d, device=DEVICE, dtype=qkv.dtype)
+    kw = torch.ones_like(qw)
+    cache = torch.ones(4, rotary, device=DEVICE, dtype=qkv.dtype)
+    flat = torch.empty(t * (2 * hq + hk) * d, device=DEVICE, dtype=qkv.dtype)
+    q, k, gate = [v.reshape(t, -1) for v in flat.split(
+        [t * hq * d, t * hk * d, t * hq * d])]
+    torch.ops._xpu_C.qkv_split_norm_rope(
+        qkv, pos, qw, kw, cache, q, k, gate, hq, hk, d, rotary, 1e-6, 1.0,
+        [], False)
+    ref = _reference(qkv, pos, qw, kw, cache, hq, hk, d, rotary, 1e-6, 1.0,
+                     True, [], False)
+    for actual, expected in zip((q, k, gate), ref):
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+
+def test_qkv_split_norm_rope_resolves_negative_view():
+    # PyTorch's Negative fallback resolves the lazy view before native
+    # dispatch. Validate the value instead of expecting a host rejection.
+    torch.manual_seed(187)
+    t, hq, hk, d, rotary = 2, 2, 1, 128, 64
+    qkv = torch.randn(t, 2 * (hq + hk) * d, device=DEVICE,
+                      dtype=torch.float16)
+    positions = torch.zeros(t, device=DEVICE, dtype=torch.int64)
+    base = torch.full((d, ), 0.25, device=DEVICE, dtype=qkv.dtype)
+    qw = torch._neg_view(base)
+    kw = torch.ones_like(base)
+    cache = torch.randn(4, rotary, device=DEVICE, dtype=qkv.dtype)
+    q = torch.empty(t, hq * d, device=DEVICE, dtype=qkv.dtype)
+    k = torch.empty(t, hk * d, device=DEVICE, dtype=qkv.dtype)
+    gate = torch.empty_like(q)
+    torch.ops._xpu_C.qkv_split_norm_rope(
+        qkv, positions, qw, kw, cache, q, k, gate, hq, hk, d, rotary, 1e-6,
+        1.0, [], False)
+    reference = _reference(qkv, positions, qw.resolve_neg(), kw, cache,
+                           hq, hk, d, rotary, 1e-6, 1.0, True, [], False)
+    for actual, expected in zip((q, k, gate), reference):
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert qw.is_neg()
+    torch.testing.assert_close(base, torch.full_like(base, 0.25),
+                               atol=0, rtol=0)
