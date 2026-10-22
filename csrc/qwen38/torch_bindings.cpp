@@ -20,6 +20,8 @@
 #include "qwen38/qsa_sycl_owner.h"
 #include "qwen38/tensor_binding.h"
 
+int qwen4_hc_dense_glue_max_m();
+
 namespace {
 bool direct_tensor_flags_host(const std::vector<at::Tensor>& tensors) {
   for (const auto& tensor : tensors) {
@@ -97,6 +99,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("HC_DENSE_GLUE_MAX_M") = qwen4_hc_dense_glue_max_m();
   module.attr("greedy_argmax_sycl_abi_version") = 1;
   module.attr("greedy_argmax_sycl_tp_sizes") = pybind11::make_tuple(4, 8);
   module.def(

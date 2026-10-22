@@ -251,8 +251,8 @@ def test_dense_tp1_up_gate_does_not_accept_sharded_tp2_or_invalid_layout(
     torch.testing.assert_close(output, before, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
-@pytest.mark.parametrize("injection_stride", [4, 656])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 33, 128, 512, 1024, 4096])
+@pytest.mark.parametrize("injection_stride", [4, 336, 656])
 def test_dense_hc_math_and_materialized_fp16_residual(prefill_hc, m,
                                                      injection_stride):
     """H5120 keeps FP16 residual storage before the independent FP32 norm."""
@@ -323,13 +323,15 @@ def test_dense_hc_graph_uses_current_inputs_on_nondefault_stream(prefill_hc, m):
     torch.xpu.current_stream().wait_stream(stream)
 
 
+@pytest.mark.parametrize("m", [2, 9])
 @pytest.mark.parametrize("invalid", ["input_alias", "output_alias", "eps",
-                                      "weight_dtype", "injection_stride"])
+                                      "weight_dtype", "injection_stride",
+                                      "hidden_stride", "hidden_negative"])
 def test_dense_hc_rejects_invalid_call_before_any_output_write(prefill_hc,
-                                                              invalid):
-    x = torch.randn(2, 20480, device="xpu", dtype=torch.float16)
-    block = torch.randn(2, 5120, device="xpu", dtype=torch.float16)
-    injection = torch.randn(2, 4, device="xpu", dtype=torch.float16)
+                                                              invalid, m):
+    x = torch.randn(m, 20480, device="xpu", dtype=torch.float16)
+    block = torch.randn(m, 5120, device="xpu", dtype=torch.float16)
+    injection = torch.randn(m, 4, device="xpu", dtype=torch.float16)
     weight = torch.zeros(20480, device="xpu", dtype=torch.float16)
     combined, normed = torch.full_like(x, 77), torch.full_like(x, -55)
     eps = 1e-6
@@ -341,8 +343,14 @@ def test_dense_hc_rejects_invalid_call_before_any_output_write(prefill_hc,
         eps = float("nan")
     elif invalid == "weight_dtype":
         weight = weight.float()
+    elif invalid == "injection_stride":
+        injection = injection[:1].expand(m, -1)
+    elif invalid == "hidden_stride":
+        backing = torch.empty(m, 40960, device="xpu", dtype=torch.float16)
+        backing[:, ::2].copy_(x)
+        x = backing[:, ::2]
     else:
-        injection = injection[:1].expand(2, -1)
+        x = torch._neg_view(x)
     before = [v.clone() for v in (combined, normed)]
     with pytest.raises(RuntimeError):
         prefill_hc.hc_dense_combine_norm(x, block, injection, weight,
@@ -1081,3 +1089,29 @@ def test_padded_alias_rejected_before_submit(hc, reader):
         with pytest.raises(RuntimeError, match="overlap"):
             hc.up(lowrank, weight, output)
     assert torch.all(output == 7).item()
+
+
+@pytest.mark.parametrize("name", [
+    "hc_dense_down_silu", "hc_dense_down_silu_smallm", "hc_dense_down_silu_tp1",
+    "hc_dense_up_gate_mix_tp1"
+])
+def test_dense_prefill_does_not_expand_projection_rows(prefill_hc, name):
+    """A wider glue limit must not reach kernels specialized for M1..8."""
+    x = torch.empty(9, 20480, device="xpu", dtype=torch.float16)
+    output = torch.full((9, 320), 77, device="xpu", dtype=torch.float16)
+    if name == "hc_dense_up_gate_mix_tp1":
+        low = torch.empty(9, 640, device="xpu", dtype=torch.float16)
+        weight = torch.empty(20480, 640, device="xpu", dtype=torch.float16)
+        output = torch.full((9, 5120), 77, device="xpu", dtype=torch.float16)
+        args = low, weight, x, output
+    elif name == "hc_dense_down_silu_tp1":
+        weight = torch.empty(640, 20480, device="xpu", dtype=torch.float16)
+        output = torch.full((9, 640), 77, device="xpu", dtype=torch.float16)
+        args = x, weight, output, None
+    else:
+        weight = torch.empty(320, 20480, device="xpu", dtype=torch.float16)
+        args = x, weight, output
+    before = output.clone()
+    with pytest.raises(RuntimeError, match="M=1..8"):
+        getattr(prefill_hc, name)(*args)
+    torch.testing.assert_close(output, before, atol=0, rtol=0)

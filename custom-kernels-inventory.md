@@ -23,7 +23,7 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 | 模块族 | 统一模块入口与 provider |
 | --- | --- |
 | HC | `_qwen38_C` 的 norm/combine/gate/down/up；`qwen38_hc_sycl` workspace 和同一 DSO 的 direct class。TP4维度10240/2560、低秩320，M1/M2–8。另有 `hc_prefill_grouped_norm`、`hc_prefill_combine`、`hc_prefill_combine_norm`、`hc_prefill_gate_mix` 四个 M9–4096 入口，只融合原FP16边界/FP32数学，不改变GEMM；caller-owned输出、alias预检和当前in-order stream生命周期保留。 |
-| Qwen4 dense HC | `hc_dense_grouped_norm`、`hc_dense_combine_norm`、`hc_dense_gate_mix` 覆盖 FP16 `[M,20480]`、4路各5120、M1–8；combine 接受带行间 padding 的 `[M,4]` injection。合并残差先舍入FP16，再做FP32 grouped Gemma RMSNorm；gate沿用FP32 sigmoid/mean。保留原FP16投影和SSM状态精度；旧DSO没有新入口时模型保持原回退。 |
+| Qwen4 dense HC | `hc_dense_grouped_norm`、`hc_dense_combine_norm`、`hc_dense_gate_mix` 覆盖 FP16 `[M,20480]`、4路各5120；M1–8 保留原路径，M9–4096 用于非 capture 的 SYCL prefill。`_qwen38_C.HC_DENSE_GLUE_MAX_M` 标识大M能力，旧DSO没有该常量时在提交前保持原回退。combine 接受带行间 padding 的 `[M,4]` injection；残差先舍入FP16，再做FP32 grouped Gemma RMSNorm，gate沿用FP32 sigmoid/mean。投影的 M<=8 约束和SSM状态精度保持。 |
 | Qwen4 dense HC down | `hc_dense_down_silu` 接受 TP2 的 FP16 `[320/336,20480]` 活动权重；M1 的 40 路 K 分片与 SiLU 融合。merged 只计算 320 个低秩和 4 个 injection 输出，跳过 12 行无效 padding；保留投影、除以 4 和 SiLU 的 FP16 舍入边界。支持当前 stream 和动态 graph replay，不缓存权重副本。 |
 | PLE | 13个 `ple_*` dispatcher：NGram、embedding、norm、score/gate、融合 norm、residual 和 decode/prefill/spec short-conv。trusted 元数据只接受生产者证明，不把普通调用伪装 trusted。 |
 | GDN | `gdn_decode_sycl`、`gdn_spec_v2_sycl`、`gdn_norm_gate_sycl`、`gdn_norm_int4_sycl`；`qwen38_gdn.py` 保留模型侧参数顺序。ordinary decode 支持 TP1/TP2/TP4/TP8 sequential 几何，并为 TP1/TP2 保留 FP32 A_log；新 TP1/TP2 几何由可选能力 ABI 探测。TP1/TP2 speculative 默认保留实测更快的 stock 普通 SYCL，不宣告未实现的 interleaved 布局。 |

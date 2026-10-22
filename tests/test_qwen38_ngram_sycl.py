@@ -116,28 +116,44 @@ def test_eos_hash_matches_independent_segment_reference(ops, eos):
     )
 
 
-def test_eos_hash_graph_replay_uses_current_device_inputs(ops):
-    x = torch.tensor([271], device="xpu")
-    ctx = torch.tensor([[11316, 13]], device="xpu")
+@pytest.mark.parametrize("m", range(1, 9))
+def test_eos_hash_graph_replay_uses_current_device_inputs(ops, m):
+    x = torch.full((m,), 271, dtype=torch.int64, device="xpu")
+    ctx = torch.tensor(
+        [[11316 + row, 13 + row] for row in range(m)], device="xpu"
+    )
     mult = torch.tensor(MULT, device="xpu")
-    out = torch.empty(1, 16, dtype=torch.int64, device="xpu")
+    out = torch.empty(m, 16, dtype=torch.int64, device="xpu")
     ops.ngram_decode_ids_eos(x, ctx, mult, out, 2)
     torch.xpu.synchronize()
     graph = torch.xpu.XPUGraph()
     with torch.xpu.graph(graph):
         ops.ngram_decode_ids_eos(x, ctx, mult, out, 2)
-    for current, history, effective in [
+    scenarios = [
         (271, [11316, 13], [11316, 13]),
         (271, [11316, 2], [2, 2]),
         (2, [11316, 13], [2, 2]),
         (271, [2, 13], [2, 13]),
-    ]:
-        x.copy_(torch.tensor([current], device="xpu"))
-        ctx.copy_(torch.tensor([history], device="xpu"))
+    ]
+    for phase in range(len(scenarios)):
+        inputs, histories, expected = [], [], []
+        for row in range(m):
+            current, history, effective = scenarios[
+                (row + phase) % len(scenarios)
+            ]
+            inputs.append(2 if current == 2 else current + row)
+            histories.append(
+                [2 if token == 2 else token + row for token in history]
+            )
+            expected.append(
+                [2 if token == 2 else token + row for token in effective]
+            )
+        x.copy_(torch.tensor(inputs, device="xpu"))
+        ctx.copy_(torch.tensor(histories, device="xpu"))
         graph.replay()
         torch.testing.assert_close(
             out.cpu(),
-            hash_reference([current], [effective], MULT),
+            hash_reference(inputs, expected, MULT),
             rtol=0,
             atol=0,
         )

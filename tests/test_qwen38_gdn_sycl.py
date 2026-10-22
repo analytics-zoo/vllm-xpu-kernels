@@ -233,8 +233,9 @@ def test_decode_unaligned_storage_offset(gdn_ops):
 
 
 @pytest.mark.parametrize("h,hv", [(16, 48), (8, 24), (4, 12), (2, 6)])
-def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv):
-    cpu = _case(h, hv, 1, spec=False)
+@pytest.mark.parametrize("m", range(1, 9))
+def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv, m):
+    cpu = _case(h, hv, m, spec=False)
     gpu = _xpu(cpu)
     gpu["idx"].fill_(-1)
 
@@ -254,7 +255,7 @@ def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv):
     torch.testing.assert_close(gpu["conv"].cpu(), cpu["conv"], atol=0, rtol=0)
     torch.testing.assert_close(gpu["ssm"].cpu(), cpu["ssm"], atol=0, rtol=0)
     for slot in (2, 5, 2):
-        cpu["idx"].fill_(slot)
+        cpu["idx"].copy_((torch.arange(m) + slot) % cpu["conv"].shape[0])
         cpu["qkvz"].add_(0.01)
         gpu["idx"].copy_(cpu["idx"])
         gpu["qkvz"].copy_(cpu["qkvz"])

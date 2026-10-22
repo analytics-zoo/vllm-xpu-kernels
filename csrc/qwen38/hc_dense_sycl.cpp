@@ -25,6 +25,7 @@ constexpr int kStreams = 4;
 constexpr int kWidth = kHidden * kStreams;
 constexpr int kLocal = 512;
 constexpr int kSg = 16;
+constexpr int kGlueMaxM = 4096;
 
 void check_tensor(
     const at::Tensor& value,
@@ -44,6 +45,16 @@ void check_hidden(const at::Tensor& hidden) {
       hidden.is_xpu() && hidden.dim() == 2 && hidden.size(0) >= 1 &&
           hidden.size(0) <= 8,
       "Qwen4 HC supports XPU [M,20480], M=1..8");
+  check_tensor(hidden, hidden, {hidden.size(0), kWidth});
+}
+
+// Only row-wise glue may accept prefill rows. Projection kernels retain the
+// original check_hidden(M<=8), including TP1 DPAS and small-M down/SiLU.
+void check_glue_hidden(const at::Tensor& hidden) {
+  TORCH_CHECK(
+      hidden.is_xpu() && hidden.dim() == 2 && hidden.size(0) >= 1 &&
+          hidden.size(0) <= kGlueMaxM,
+      "Qwen4 HC glue supports XPU [M,20480], M=1..4096");
   check_tensor(hidden, hidden, {hidden.size(0), kWidth});
 }
 
@@ -164,7 +175,7 @@ void check_norm(
     const at::Tensor& weight,
     const at::Tensor& output,
     double eps) {
-  check_hidden(hidden);
+  check_glue_hidden(hidden);
   check_tensor(weight, hidden, {kWidth});
   check_tensor(output, hidden, {hidden.size(0), kWidth});
   TORCH_CHECK(
@@ -855,7 +866,7 @@ void up_gate_mix(
 class DenseGateKernel;
 void gate_mix(
     const at::Tensor& input, const at::Tensor& gate, at::Tensor& output) {
-  check_hidden(input);
+  check_glue_hidden(input);
   check_tensor(gate, input, {input.size(0), kWidth});
   check_tensor(output, input, {input.size(0), kHidden});
   check_disjoint({&output}, {&input, &gate});
@@ -883,6 +894,8 @@ void gate_mix(
       });
 }
 }  // namespace
+
+int qwen4_hc_dense_glue_max_m() { return kGlueMaxM; }
 
 #define QWEN4_LIBRARY_FRAGMENT(NAME, MODULE) \
   TORCH_LIBRARY_FRAGMENT(NAME, MODULE)
