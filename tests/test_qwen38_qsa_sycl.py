@@ -259,7 +259,9 @@ def attention_case(rows, heads, length, page_size):
     torch.manual_seed(223 + rows + length)
     q = torch.randn(rows, heads, 256, dtype=torch.float16)
     pages = (length + page_size - 1) // page_size
-    packed = torch.randn(pages, 1, page_size, 512, dtype=torch.float16)
+    packed = torch.randn(
+        pages, 2 if heads == 12 else 1, page_size, 512, dtype=torch.float16
+    )
     table = torch.arange(pages, dtype=torch.int32).reshape(1, pages)
     requests = torch.zeros(rows, dtype=torch.int32)
     indices = torch.full((rows, 2051), -1, dtype=torch.int32)
@@ -280,10 +282,15 @@ def attention_golden(case):
         logical = indices[row]
         logical = logical[logical >= 0].long()
         physical = table[requests[row], logical // page_size].long()
-        kv = packed[physical, 0, logical % page_size]
-        scores = q[row].float() @ kv[:, :256].float().T
-        probability = torch.softmax(scores * 0.0625, dim=-1)
-        result[row] = (probability @ kv[:, 256:].float()).half()
+        group_heads = q.size(1) // packed.size(1)
+        for kv_head in range(packed.size(1)):
+            head_slice = slice(
+                kv_head * group_heads, (kv_head + 1) * group_heads
+            )
+            kv = packed[physical, kv_head, logical % page_size]
+            scores = q[row, head_slice].float() @ kv[:, :256].float().T
+            probability = torch.softmax(scores * 0.0625, dim=-1)
+            result[row, head_slice] = (probability @ kv[:, 256:].float()).half()
     return result
 
 
@@ -1699,3 +1706,77 @@ def test_selection_graph_reuses_poisoned_scratch_with_padded_holed_cache(
         expected[0, tokens.numel():tokens.numel() + tail.numel()] = tail
         torch.testing.assert_close(case[8].cpu(), expected, atol=0, rtol=0)
     assert torch.isnan(backing[..., 128:]).all()
+
+
+@pytest.mark.parametrize("rows", range(1, 9))
+@pytest.mark.parametrize("page_size,length", [(256, 1024), (512, 8192)])
+def test_qwen4_tp2_attention_two_kv_heads_matches_independent_math(
+    native, rows, page_size, length
+):
+    assert native.qsa_sycl_q12_kv2_abi_version == 1
+    case = attention_case(rows, 12, length, page_size)
+    output = torch.empty_like(case[0])
+    partials = torch.empty(rows, 12, 43, 258, dtype=torch.float32, device="xpu")
+    native.token_split_attention_v3(*case, page_size, output, partials)
+    torch.testing.assert_close(
+        output.cpu(), attention_golden(case), atol=0.004, rtol=0.004
+    )
+
+
+def test_qwen4_tp2_attention_graph_reads_each_live_kv_group(native):
+    case = attention_case(1, 12, 1024, 256)
+    output = torch.empty_like(case[0])
+    partials = torch.empty(1, 12, 43, 258, dtype=torch.float32, device="xpu")
+    native.token_split_attention_v3(*case, 256, output, partials)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        native.token_split_attention_v3(*case, 256, output, partials)
+    case[1][:, 0, :, 256:].fill_(0.25)
+    case[1][:, 1, :, 256:].fill_(-0.75)
+    graph.replay()
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        output[:, :6],
+        torch.full_like(output[:, :6], 0.25),
+        atol=0.001,
+        rtol=0.001,
+    )
+    torch.testing.assert_close(
+        output[:, 6:],
+        torch.full_like(output[:, 6:], -0.75),
+        atol=0.001,
+        rtol=0.001,
+    )
+
+
+def test_qwen4_tp2_attention_rejects_incompatible_kv_before_write(native):
+    case = list(attention_case(1, 12, 1024, 256))
+    case[1] = torch.zeros(4, 1, 256, 512, dtype=torch.float16, device="xpu")
+    output = torch.full_like(case[0], 7)
+    partials = torch.full(
+        (1, 12, 43, 258), 11, dtype=torch.float32, device="xpu"
+    )
+    with pytest.raises(RuntimeError, match="KV=2"):
+        native.token_split_attention_v3(*case, 256, output, partials)
+    assert bool((output == 7).all())
+    assert bool((partials == 11).all())
+
+@pytest.mark.parametrize("rows", [129, 4096])
+def test_qwen4_tp2_attention_prefill_chunk_preserves_each_kv_group(
+    native, rows
+):
+    # Cross the 128-row native scratch tile with an independent constant-V
+    # result; Q/K and merge ordering cannot change either group's expectation.
+    case = attention_case(rows, 12, 128, 256)
+    case[1][:, 0, :, 256:] = 0.25
+    case[1][:, 1, :, 256:] = -0.75
+    output = torch.empty_like(case[0])
+    partials = torch.empty(
+        min(rows, 128), 12, 43, 258, dtype=torch.float32, device="xpu"
+    )
+    native.token_split_attention_v3(*case, 256, output, partials)
+    expected = torch.empty_like(output)
+    expected[:, :6] = 0.25
+    expected[:, 6:] = -0.75
+    torch.testing.assert_close(output, expected, atol=0.001, rtol=0.001)

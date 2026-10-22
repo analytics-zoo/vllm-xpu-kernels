@@ -32,6 +32,9 @@ qsa_sycl_selection_host_max_seq_len = 1
 qsa_sycl_selection_max_rows = 4096
 qsa_sycl_attention_max_rows = 4096
 qsa_sycl_q6 = 1
+qsa_sycl_q12_kv2_abi_version = int(
+    getattr(_qwen38_C, "qsa_sycl_q12_kv2_abi_version", 0)
+)
 qsa_token_split_candidate_page512 = 1
 qsa_sycl_qkv_postprocess_v1 = 1
 qsa_sycl_indexer_norm_rope_v1 = 1
@@ -46,7 +49,8 @@ qsa_store_m1_transaction_abi_version = int(
     callable(getattr(_qwen38_C, "qsa_sycl_try_store_m1_transaction_v1", None))
 )
 _m1_fused_store = getattr(
-    _qwen38_C, "qsa_sycl_try_store_m1_transaction_fused_v1", None)
+    _qwen38_C, "qsa_sycl_try_store_m1_transaction_fused_v1", None
+)
 if not callable(_m1_fused_store):
     _m1_fused_store = None
 
@@ -73,12 +77,16 @@ class _StreamScratch:
         stream = torch.xpu.current_stream(tensor.device)
         return int(stream.device_index), int(stream.stream_id)
 
-    def selection(self, q: torch.Tensor,
-                  max_seq_len: int) -> tuple[torch.Tensor, ...]:
+    def selection(
+        self, q: torch.Tensor, max_seq_len: int
+    ) -> tuple[torch.Tensor, ...]:
         rows = int(q.shape[0])
         scratch_rows = min(rows, 32)
-        if (rows >= 128 and max_seq_len >= 4096
-                and qsa_sycl_selection_wide_scratch_abi_version == 1):
+        if (
+            rows >= 128
+            and max_seq_len >= 4096
+            and qsa_sycl_selection_wide_scratch_abi_version == 1
+        ):
             scratch_rows = 128
         key = (*self._stream_key(q), scratch_rows)
         with self._lock:
@@ -158,18 +166,27 @@ def qsa_select_paged_tokens_v2(
 def _packed_kv(
     k_cache: torch.Tensor, v_cache: torch.Tensor, page_size: int
 ) -> torch.Tensor:
+    kv_heads = int(k_cache.shape[2]) if k_cache.ndim == 4 else 0
+    expected_stride = (
+        kv_heads * page_size * 512,
+        512,
+        page_size * 512 if kv_heads > 1 else 256,
+        1,
+    )
     if (
-        k_cache.ndim != 4
+        kv_heads not in (1, 2)
         or v_cache.shape != k_cache.shape
-        or tuple(k_cache.shape[1:]) != (page_size, 1, 256)
-        or tuple(k_cache.stride()) != (page_size * 512, 512, 256, 1)
-        or tuple(v_cache.stride()) != tuple(k_cache.stride())
+        or tuple(k_cache.shape[1:]) != (page_size, kv_heads, 256)
+        or tuple(k_cache.stride()) != expected_stride
+        or tuple(v_cache.stride()) != expected_stride
         or v_cache.data_ptr() - k_cache.data_ptr() != 512
+        or k_cache.untyped_storage().data_ptr()
+        != v_cache.untyped_storage().data_ptr()
     ):
         raise ValueError("SYCL QSA requires adjacent packed K/V cache")
     return k_cache.as_strided(
-        (k_cache.shape[0], 1, page_size, 512),
-        (page_size * 512, page_size * 512, 512, 1),
+        (k_cache.shape[0], kv_heads, page_size, 512),
+        (kv_heads * page_size * 512, page_size * 512, 512, 1),
     )
 
 
@@ -183,8 +200,12 @@ def sparse_paged_attention_v2(
     page_size: int,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    if int(q.shape[1]) not in (3, 6):
-        raise ValueError("SYCL QSA attention supports 3 or 6 query heads")
+    if int(q.shape[1]) not in (3, 6, 12):
+        raise ValueError("SYCL QSA attention supports 3, 6 or 12 query heads")
+    if q.shape[1] == 12 and qsa_sycl_q12_kv2_abi_version != 1:
+        raise ValueError(
+            "SYCL QSA Q12/KV2 requires a compatible native library"
+        )
     packed = _packed_kv(k_cache, v_cache, int(page_size))
     return _qwen38_C.token_split_attention_v3(
         q,
@@ -196,6 +217,13 @@ def sparse_paged_attention_v2(
         out,
         _scratch.attention(q),
     )
+
+
+def sparse_paged_attention_q12_v1(*args: object) -> torch.Tensor:
+    q = args[0]
+    if not isinstance(q, torch.Tensor) or q.ndim != 3 or q.shape[1] != 12:
+        raise ValueError("q12 entry requires twelve query heads")
+    return sparse_paged_attention_v2(*args)
 
 
 def sparse_paged_attention_q6_v1(*args: object) -> torch.Tensor:

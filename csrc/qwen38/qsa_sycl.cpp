@@ -43,6 +43,8 @@ template <typename T, bool PowerOfTwo>
 class CompressKernel;
 template <int PageSize, bool BlockRead, int Subgroup, int Prefetch>
 class AttentionPhase0;
+template <int PageSize, bool BlockRead, int Subgroup, int Prefetch>
+class AttentionPhase0MultiKv;
 template <int PageSize>
 class AttentionPrefillQkDpasPhase0;
 template <int Columns, int Prefetch>
@@ -431,7 +433,12 @@ sycl::event launch_prefill_qk_dpas_phase0(
   });
 }
 
-template <int PageSize, bool BlockRead, int Subgroup, int Prefetch = 1>
+template <
+    int PageSize,
+    bool BlockRead,
+    int Subgroup,
+    int Prefetch = 1,
+    int KvHeads = 1>
 sycl::event launch_phase0(
     sycl::queue& queue,
     const half* q,
@@ -449,6 +456,11 @@ sycl::event launch_phase0(
     int partial_count,
     sycl::event previous,
     bool has_previous) {
+  static_assert(KvHeads == 1 || KvHeads == 2);
+  using Kernel = std::conditional_t<
+      KvHeads == 1,
+      AttentionPhase0<PageSize, BlockRead, Subgroup, Prefetch>,
+      AttentionPhase0MultiKv<PageSize, BlockRead, Subgroup, Prefetch>>;
   constexpr int workers = 4;
   constexpr int values_per_lane = kHeadDim / Subgroup;
   const int64_t groups = static_cast<int64_t>(rows) * heads * partial_count;
@@ -456,7 +468,7 @@ sycl::event launch_phase0(
     if (has_previous) cgh.depends_on(previous);
     sycl::local_accessor<float, 1> scratch(
         sycl::range<1>(workers * (kPartialStride)), cgh);
-    cgh.parallel_for<AttentionPhase0<PageSize, BlockRead, Subgroup, Prefetch>>(
+    cgh.parallel_for<Kernel>(
         sycl::nd_range<1>(
             sycl::range<1>(groups * Subgroup * workers),
             sycl::range<1>(Subgroup * workers)),
@@ -467,6 +479,9 @@ sycl::event launch_phase0(
           const int partial = group % partial_count;
           const int head = (group / partial_count) % heads;
           const int row = group / (partial_count * heads);
+          // Q12/KV2 has six query heads per KV group. Keep KV1 address
+          // arithmetic compiled exactly as the original Q3/Q6 kernel.
+          const int kv_head = KvHeads == 1 ? 0 : head / 6;
           const int request = reqs[row];
           const bool valid_request = request >= 0 && request < table_rows;
           const int32_t* row_indices = indices + row * kSlots;
@@ -520,9 +535,11 @@ sycl::event launch_phase0(
               if (!valid) {
                 continue;
               }
-              const int64_t base = (static_cast<int64_t>(physical) * PageSize +
-                                    (logical % PageSize)) *
-                                   512;
+              const int64_t base =
+                  ((static_cast<int64_t>(physical) * KvHeads + kv_head) *
+                       PageSize +
+                   (logical % PageSize)) *
+                  512;
               const half* kv = packed + base;
               float dot = 0.0f;
               sycl::vec<uint32_t, values_per_lane / 2> key_words;
@@ -625,7 +642,8 @@ sycl::event launch_phase0(
                   continue;
                 }
                 const int64_t base =
-                    (static_cast<int64_t>(physical) * PageSize +
+                    ((static_cast<int64_t>(physical) * KvHeads + kv_head) *
+                         PageSize +
                      (logical % PageSize)) *
                     512;
                 bases[b] = base;
@@ -1093,17 +1111,20 @@ at::Tensor token_split_attention_v3(
   check_xpu(partials, q, at::kFloat, "partials");
   TORCH_CHECK(
       q.scalar_type() == at::kHalf && q.dim() == 3 && q.size(0) >= 1 &&
-          q.size(0) <= 4096 && (q.size(1) == 3 || q.size(1) == 6) &&
+          q.size(0) <= 4096 &&
+          (q.size(1) == 3 || q.size(1) == 6 || q.size(1) == 12) &&
           q.size(2) == kHeadDim && q.is_contiguous(),
-      "q must be contiguous FP16 [1..4096,3|6,256]");
+      "q must be contiguous FP16 [1..4096,3|6|12,256]");
   TORCH_CHECK(
       page_size == 256 || page_size == 512, "page_size must be 256 or 512");
   TORCH_CHECK(
-      packed_kv.dim() == 4 && packed_kv.size(0) > 0 && packed_kv.size(1) == 1 &&
+      packed_kv.dim() == 4 && packed_kv.size(0) > 0 &&
+          packed_kv.size(1) == (q.size(1) == 12 ? 2 : 1) &&
           packed_kv.size(2) == page_size && packed_kv.size(3) == 512 &&
-          packed_kv.stride(0) == page_size * 512 &&
+          packed_kv.stride(0) == packed_kv.size(1) * page_size * 512 &&
+          (packed_kv.size(1) == 1 || packed_kv.stride(1) == page_size * 512) &&
           packed_kv.stride(2) == 512 && packed_kv.stride(3) == 1,
-      "packed_kv must expose [pages,1,page_size,512]");
+      "packed_kv must expose [pages,KV,page_size,512], KV=2 for Q12");
   TORCH_CHECK(
       logical_indices.sizes() == at::IntArrayRef({q.size(0), kSlots}) &&
           logical_indices.is_contiguous(),
@@ -1223,12 +1244,37 @@ at::Tensor token_split_attention_v3(
             has_previous);
       }
     }
-    if (total_rows == 1) {
+    auto launch_generic = [&](auto kv_tag) {
+      if (total_rows == 1) {
+        return launch_phase0<
+            decltype(page_tag)::value,
+            decltype(block_tag)::value,
+            32,
+            decltype(block_tag)::value ? 2 : 1,
+            decltype(kv_tag)::value>(
+            queue,
+            row_q,
+            packed_ptr,
+            row_indices,
+            table_ptr,
+            row_reqs,
+            partial_ptr,
+            rows,
+            heads,
+            block_table.size(0),
+            block_table.size(1),
+            packed_kv.size(0),
+            tokens_per_partial,
+            partial_count,
+            previous,
+            has_previous);
+      }
       return launch_phase0<
           decltype(page_tag)::value,
           decltype(block_tag)::value,
-          32,
-          decltype(block_tag)::value ? 2 : 1>(
+          16,
+          1,
+          decltype(kv_tag)::value>(
           queue,
           row_q,
           packed_ptr,
@@ -1245,27 +1291,11 @@ at::Tensor token_split_attention_v3(
           partial_count,
           previous,
           has_previous);
+    };
+    if (heads == 12) {
+      return launch_generic(std::integral_constant<int, 2>{});
     }
-    return launch_phase0<
-        decltype(page_tag)::value,
-        decltype(block_tag)::value,
-        16>(
-        queue,
-        row_q,
-        packed_ptr,
-        row_indices,
-        table_ptr,
-        row_reqs,
-        partial_ptr,
-        rows,
-        heads,
-        block_table.size(0),
-        block_table.size(1),
-        packed_kv.size(0),
-        tokens_per_partial,
-        partial_count,
-        previous,
-        has_previous);
+    return launch_generic(std::integral_constant<int, 1>{});
   };
   sycl::event previous;
   bool has_previous = false;

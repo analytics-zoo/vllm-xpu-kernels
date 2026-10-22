@@ -136,6 +136,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("run", &HcSyclMultiMWorkspace::run);
   vllm::qwen38::moe_sycl::bind_moe_sycl_workspace(module);
   module.attr("qsa_sycl_selection_wide_scratch_abi_version") = 1;
+  module.attr("qsa_sycl_q12_kv2_abi_version") = 1;
   module.def("group_compress_v2", &vllm::qwen38::qsa_sycl::group_compress_v2);
   module.def(
       "select_paged_tokens_v2",
