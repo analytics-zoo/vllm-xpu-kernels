@@ -10,6 +10,8 @@
 #include "qwen38/gdn_sycl.h"
 #include "qwen38/gdn_sycl_workspace.h"
 #include "qwen38/hc_sycl_workspace.h"
+#include "qwen38/metadata_sycl.h"
+#include "qwen38/greedy_sycl.h"
 #include "qwen38/ngram.h"
 #include "qwen38/moe_sycl_workspace.h"
 #include "qwen38/ops.h"
@@ -17,6 +19,8 @@
 #include "qwen38/qsa_sycl_aux.h"
 #include "qwen38/qsa_sycl_owner.h"
 #include "qwen38/tensor_binding.h"
+
+int qwen4_hc_dense_glue_max_m();
 
 namespace {
 bool direct_tensor_flags_host(const std::vector<at::Tensor>& tensors) {
@@ -43,6 +47,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor(a!) output0, Tensor weight1, Tensor scale1, "
       "Tensor(b!) output1) -> ()");
   m.impl("int4_linear_fused2", torch::kXPU, &vllm::qwen38::int4_linear_fused2);
+  m.def(
+      "int4_dense_ba_linear(Tensor input, Tensor weight, Tensor scale, "
+      "Tensor(a!) output) -> bool");
+  m.impl(
+      "int4_dense_ba_linear", torch::kXPU, &vllm::qwen38::int4_dense_ba_linear);
   m.def(
       "ngram_decode_ids(Tensor input_ids, Tensor context, Tensor multipliers, "
       "Tensor(a!) output) -> ()");
@@ -72,6 +81,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Negative, m) {
   m.impl("q4_0_quantize", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear_fused2", torch::CppFunction::makeFallthrough());
+  m.impl("int4_dense_ba_linear", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids_eos", torch::CppFunction::makeFallthrough());
   m.impl("ngram_host_lookup", torch::CppFunction::makeFallthrough());
@@ -81,6 +91,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
   m.impl("q4_0_quantize", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear", torch::CppFunction::makeFallthrough());
   m.impl("int4_linear_fused2", torch::CppFunction::makeFallthrough());
+  m.impl("int4_dense_ba_linear", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids", torch::CppFunction::makeFallthrough());
   m.impl("ngram_decode_ids_eos", torch::CppFunction::makeFallthrough());
   m.impl("ngram_host_lookup", torch::CppFunction::makeFallthrough());
@@ -88,8 +99,19 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("HC_DENSE_GLUE_MAX_M") = qwen4_hc_dense_glue_max_m();
+  module.attr("HC_PREFILL_MAX_M") = 8192;
+  module.attr("greedy_argmax_sycl_abi_version") = 1;
+  module.attr("greedy_argmax_sycl_tp_sizes") = pybind11::make_tuple(4, 8);
+  module.def(
+      "try_global_argmax_token_int32",
+      &vllm::qwen38::try_global_argmax_token_int32);
+  module.def("try_local_argmax_packet", &vllm::qwen38::try_local_argmax_packet);
+  module.def("try_global_argmax_token", &vllm::qwen38::try_global_argmax_token);
+
   namespace py = pybind11;
   module.def("direct_tensor_flags_host", &direct_tensor_flags_host);
+  module.def("try_copy_metadata_out", &vllm::qwen38::try_copy_metadata_out);
   module.def("tensors_disjoint_host", &vllm::qwen38::tensors_disjoint_host);
   py::class_<vllm::qwen38::GdnSyclM1Workspace>(module, "GDNM1WorkspaceDirectV1")
       .def(py::init<>())
@@ -118,6 +140,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("run", &HcSyclMultiMWorkspace::run);
   vllm::qwen38::moe_sycl::bind_moe_sycl_workspace(module);
   module.attr("qsa_sycl_selection_wide_scratch_abi_version") = 1;
+  module.attr("qsa_sycl_q12_kv2_abi_version") = 1;
   module.def("group_compress_v2", &vllm::qwen38::qsa_sycl::group_compress_v2);
   module.def(
       "select_paged_tokens_v2",

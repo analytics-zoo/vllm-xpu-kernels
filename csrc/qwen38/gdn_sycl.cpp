@@ -181,7 +181,11 @@ Shape check_core(
       m > 0 && m <= std::numeric_limits<int>::max(), "invalid token count");
   for (auto* t : {&qkvz, &conv, &weight, &bias, &dt_bias, &ba, &ssm, &out, &z})
     check_data(*t, qkvz, at::kHalf, "GDN data tensor");
-  check_data(a_log, qkvz, speculative ? at::kFloat : at::kHalf, "A_log");
+  const bool float_a_log =
+      speculative ||
+      (ssm.dim() == 4 && (ssm.size(1) == 24 || ssm.size(1) == 48) &&
+       a_log.scalar_type() == at::kFloat);
+  check_data(a_log, qkvz, float_a_log ? at::kFloat : at::kHalf, "A_log");
   TORCH_CHECK(
       qkvz.dim() == 2 && qkvz.size(0) == m && qkvz.stride(1) == 1 &&
           qkvz.stride(0) >= qkvz.size(1),
@@ -193,11 +197,11 @@ Shape check_core(
           ssm.stride(0) >= ssm.size(1) * kDim * kDim,
       "invalid SSM state layout");
   const int hv = static_cast<int>(ssm.size(1));
-  // Qwen3.8 config: 16 key heads and 48 value heads. TP4=4/12;
-  // TP8=2/6. The old 'HV=8' comment describes another model.
+  // 16 key heads / 48 value heads: TP2=8/24, TP4=4/12, TP8=2/6.
   const int h = hv / 3;
   TORCH_CHECK(
-      (h == 4 && hv == 12) || (h == 2 && hv == 6),
+      (h == 16 && hv == 48) || (h == 8 && hv == 24) || (h == 4 && hv == 12) ||
+          (h == 2 && hv == 6),
       "unsupported Qwen3.8 GDN geometry: H=",
       h,
       " HV=",
@@ -795,7 +799,7 @@ void launch_recurrent(
           }
           const int kh = hv / (s.hv / s.h);
           const float neg_a =
-              -sycl::exp(Spec ? a_float[hv] : float(a_half[hv]));
+              -sycl::exp(a_float != nullptr ? a_float[hv] : float(a_half[hv]));
           const float bias = float(dt_bias[hv]);
           for (int t = 0; t < spec_tokens; ++t) {
             const int global_t = Spec ? tokens[row + t] : seq;
@@ -1053,8 +1057,10 @@ void gdn_decode_sycl(
         queue,
         reinterpret_cast<const half*>(qkv.data_ptr()),
         reinterpret_cast<const half*>(ba.data_ptr()),
-        reinterpret_cast<const half*>(a_log.data_ptr()),
-        nullptr,
+        a_log.scalar_type() == at::kHalf
+            ? reinterpret_cast<const half*>(a_log.data_ptr())
+            : nullptr,
+        a_log.scalar_type() == at::kFloat ? a_log.data_ptr<float>() : nullptr,
         reinterpret_cast<const half*>(dt_bias.data_ptr()),
         reinterpret_cast<half*>(ssm_state.data_ptr()),
         ssm_indices.data_ptr<int>(),
@@ -1298,7 +1304,9 @@ void gdn_spec_conv_probe_sycl(
     int64_t hv) {
   const int64_t m = tokens.numel();
   TORCH_CHECK(
-      ((h == 4 && hv == 12) || (h == 2 && hv == 6)) && m >= 2 && m <= 8,
+      ((h == 16 && hv == 48) || (h == 8 && hv == 24) || (h == 4 && hv == 12) ||
+       (h == 2 && hv == 6)) &&
+          m >= 2 && m <= 8,
       "probe requires TP4/TP8 speculative M=2..8");
   const int64_t dim = (2 * h + hv) * kDim;
   TORCH_CHECK(qkvz.is_xpu(), "probe requires XPU tensors");

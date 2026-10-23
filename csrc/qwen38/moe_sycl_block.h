@@ -53,7 +53,7 @@ inline int signed_high(std::uint8_t packed) {
 
 template <int Vec>
 class RouterBlockKernel;
-template <int I>
+template <int I, int Subgroups>
 class UpBlockKernel;
 template <int I, int Tile, int SG, bool Prefetch>
 class DownBlockKernel;
@@ -97,7 +97,7 @@ inline void launch_router(sycl::queue& queue, Inputs p, Workspace w) {
       });
 }
 
-template <int I>
+template <int I, int Subgroups = 8>
 inline void launch_up(sycl::queue& queue, Inputs p, Workspace w) {
 #ifndef MOE_SYCL_UP_VEC
   #define MOE_SYCL_UP_VEC 8
@@ -106,9 +106,9 @@ inline void launch_up(sycl::queue& queue, Inputs p, Workspace w) {
   static_assert(vec == 4 || vec == 8 || vec == 16);
   const int routed_tasks = p.m * kR * I;
   const int total = routed_tasks + p.m * (I + 1);
-  const std::size_t groups = (total + 7) / 8;
-  queue.parallel_for<UpBlockKernel<I>>(
-      sycl::nd_range<1>(groups * kWG, kWG),
+  const std::size_t groups = (total + Subgroups - 1) / Subgroups;
+  queue.parallel_for<UpBlockKernel<I, Subgroups>>(
+      sycl::nd_range<1>(groups * Subgroups * kSG, Subgroups * kSG),
       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSG)]] {
         const int task = item.get_global_linear_id() / kSG;
         if (task >= total) return;

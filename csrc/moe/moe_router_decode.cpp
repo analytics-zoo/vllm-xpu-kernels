@@ -3,6 +3,7 @@
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 
 #include <ATen/DeviceGuard.h>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
@@ -781,6 +782,35 @@ static inline bool router_aligned16(const void* p) {
   return reinterpret_cast<uintptr_t>(p) % 16 == 0;
 }
 
+static void router_check_tensor(
+    const char* name, const torch::Tensor& tensor, const torch::Tensor& x) {
+  TORCH_CHECK(
+      tensor.is_xpu() && tensor.device() == x.device() &&
+          tensor.layout() == at::kStrided && !tensor.is_neg() &&
+          !tensor.is_conj(),
+      name,
+      ": tensors must be same-device XPU strided tensors without lazy "
+      "negation/conjugation");
+}
+
+static bool router_overlaps(const torch::Tensor& a, const torch::Tensor& b) {
+  if (a.numel() == 0 || b.numel() == 0) return false;
+  auto span = [](const torch::Tensor& tensor) {
+    int64_t last = 0;
+    for (int64_t d = 0; d < tensor.dim(); ++d)
+      last += (tensor.size(d) - 1) * tensor.stride(d);
+    return static_cast<uintptr_t>((last + 1) * tensor.element_size());
+  };
+  const auto pa = reinterpret_cast<uintptr_t>(a.const_data_ptr());
+  const auto pb = reinterpret_cast<uintptr_t>(b.const_data_ptr());
+  return pa <= pb ? pb - pa < span(a) : pa - pb < span(b);
+}
+
+static bool router_same_view(const torch::Tensor& a, const torch::Tensor& b) {
+  return a.scalar_type() == b.scalar_type() && a.sizes() == b.sizes() &&
+         a.strides() == b.strides() && a.const_data_ptr() == b.const_data_ptr();
+}
+
 // Checks shared by both entry points.
 static void router_check_common(
     const char* name,
@@ -789,10 +819,14 @@ static void router_check_common(
     const torch::Tensor& logits,
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids) {
+  for (const auto* tensor :
+       {&x, &router_weight, &logits, &topk_weights, &topk_ids})
+    router_check_tensor(name, *tensor, x);
+  TORCH_CHECK(topk_ids.dim() == 2, name, ": topk_ids must be [M,top_k]");
   TORCH_CHECK(
       x.dim() == 2 &&
           (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
-          x.stride(1) == 1,
+          x.stride(1) == 1 && x.stride(0) >= x.size(1),
       name,
       ": x must be fp16/bf16 [M, K] with unit inner stride");
   TORCH_CHECK(
@@ -807,7 +841,8 @@ static void router_check_common(
   const int64_t top_k = topk_ids.size(-1);
   TORCH_CHECK(router_weight.size(1) == K, name, ": K mismatch");
   TORCH_CHECK(M <= kRouterMaxM, name, ": at most 16 tokens");
-  TORCH_CHECK(K % kBlk == 0, name, ": K must be a multiple of 128");
+  TORCH_CHECK(
+      K > 0 && K % kBlk == 0, name, ": K must be a positive multiple of 128");
   TORCH_CHECK(
       E <= kRouterSg * kRouterMaxEpl && top_k >= 1 && top_k <= kRouterSg &&
           top_k <= E,
@@ -826,7 +861,21 @@ static void router_check_common(
       topk_weights.is_contiguous() && topk_weights.numel() == M * top_k);
   TORCH_CHECK(
       topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
-      topk_ids.numel() == M * top_k);
+      topk_ids.size(0) == M && topk_ids.numel() == M * top_k);
+  const std::array<const torch::Tensor*, 3> outputs{
+      &logits, &topk_weights, &topk_ids};
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    for (const auto* input : {&x, &router_weight})
+      TORCH_CHECK(
+          !router_overlaps(*outputs[i], *input),
+          name,
+          ": routing outputs must not overlap inputs");
+    for (size_t j = 0; j < i; ++j)
+      TORCH_CHECK(
+          !router_overlaps(*outputs[i], *outputs[j]),
+          name,
+          ": routing outputs must not overlap each other");
+  }
 }
 
 template <typename Scalar>
@@ -865,7 +914,6 @@ void router_gemv_topk_softmax(
     torch::Tensor& topk_ids,             // [M, top_k] int32
     bool renormalize) {
   using namespace vllm::moe;
-  const at::DeviceGuard device_guard(x.device());
   router_check_common(
       "router_gemv_topk_softmax",
       x,
@@ -875,6 +923,7 @@ void router_gemv_topk_softmax(
       topk_ids);
   const int64_t M = x.size(0);
   if (M == 0) return;
+  const at::DeviceGuard device_guard(x.device());
   auto& queue = vllm::xpu::vllmGetQueue();
   auto launch = [&](auto scalar) {
     using Scalar = decltype(scalar);
@@ -902,15 +951,16 @@ void router_resadd_norm_gemv_topk_softmax(
     bool renormalize) {
   using namespace vllm::moe;
   const char* name = "router_resadd_norm_gemv_topk_softmax";
-  const at::DeviceGuard device_guard(x.device());
   router_check_common(name, x, router_weight, logits, topk_weights, topk_ids);
   const int64_t M = x.size(0);
   const int64_t K = x.size(1);
   auto check_act = [&](const torch::Tensor& t, const char* what) {
+    router_check_tensor(name, t, x);
     TORCH_CHECK(
         t.dim() == 2 && t.size(0) == M && t.size(1) == K &&
             t.scalar_type() == x.scalar_type() && t.stride(1) == 1 &&
-            t.stride(0) % 8 == 0 && router_aligned16(t.data_ptr()),
+            t.stride(0) >= K && t.stride(0) % 8 == 0 &&
+            router_aligned16(t.data_ptr()),
         name,
         ": ",
         what,
@@ -925,6 +975,7 @@ void router_resadd_norm_gemv_topk_softmax(
       ": K <= ",
       kRouterNormMaxK,
       " (normed rows are staged in SLM)");
+  router_check_tensor(name, norm_weight, x);
   TORCH_CHECK(
       norm_weight.dim() == 1 && norm_weight.size(0) == K &&
           norm_weight.scalar_type() == x.scalar_type() &&
@@ -933,7 +984,37 @@ void router_resadd_norm_gemv_topk_softmax(
       name,
       ": norm_weight must be contiguous 16-byte aligned matching fp16/bf16 "
       "[K]");
+  // The two documented in-place pairs must be exact views. Cross aliases
+  // or partially overlapping rows would race between work-groups.
+  for (const auto* output : {&normed_out, &residual_out}) {
+    for (const auto* input : {&x, &residual, &norm_weight, &router_weight}) {
+      const bool allowed = (output == &normed_out && input == &x &&
+                            router_same_view(*output, *input)) ||
+                           (output == &residual_out && input == &residual &&
+                            router_same_view(*output, *input));
+      TORCH_CHECK(
+          allowed || !router_overlaps(*output, *input),
+          name,
+          ": norm outputs have an unsupported input overlap");
+    }
+    for (const auto* routed : {&logits, &topk_weights, &topk_ids})
+      TORCH_CHECK(
+          !router_overlaps(*output, *routed),
+          name,
+          ": norm and routing outputs must not overlap");
+  }
+  TORCH_CHECK(
+      !router_overlaps(normed_out, residual_out),
+      name,
+      ": norm outputs must not overlap each other");
+  for (const auto* output : {&logits, &topk_weights, &topk_ids})
+    for (const auto* input : {&residual, &norm_weight})
+      TORCH_CHECK(
+          !router_overlaps(*output, *input),
+          name,
+          ": routing outputs must not overlap norm inputs");
   if (M == 0) return;
+  const at::DeviceGuard device_guard(x.device());
   auto& queue = vllm::xpu::vllmGetQueue();
   auto launch = [&](auto scalar) {
     using Scalar = decltype(scalar);

@@ -259,7 +259,9 @@ def attention_case(rows, heads, length, page_size):
     torch.manual_seed(223 + rows + length)
     q = torch.randn(rows, heads, 256, dtype=torch.float16)
     pages = (length + page_size - 1) // page_size
-    packed = torch.randn(pages, 1, page_size, 512, dtype=torch.float16)
+    packed = torch.randn(
+        pages, 2 if heads == 12 else 1, page_size, 512, dtype=torch.float16
+    )
     table = torch.arange(pages, dtype=torch.int32).reshape(1, pages)
     requests = torch.zeros(rows, dtype=torch.int32)
     indices = torch.full((rows, 2051), -1, dtype=torch.int32)
@@ -280,10 +282,15 @@ def attention_golden(case):
         logical = indices[row]
         logical = logical[logical >= 0].long()
         physical = table[requests[row], logical // page_size].long()
-        kv = packed[physical, 0, logical % page_size]
-        scores = q[row].float() @ kv[:, :256].float().T
-        probability = torch.softmax(scores * 0.0625, dim=-1)
-        result[row] = (probability @ kv[:, 256:].float()).half()
+        group_heads = q.size(1) // packed.size(1)
+        for kv_head in range(packed.size(1)):
+            head_slice = slice(
+                kv_head * group_heads, (kv_head + 1) * group_heads
+            )
+            kv = packed[physical, kv_head, logical % page_size]
+            scores = q[row, head_slice].float() @ kv[:, :256].float().T
+            probability = torch.softmax(scores * 0.0625, dim=-1)
+            result[row, head_slice] = (probability @ kv[:, 256:].float()).half()
     return result
 
 
@@ -317,6 +324,60 @@ def test_attention_golden_and_final_esimd(native, rows, heads, length,
     reference_op(*case, page_size, ref_out, ref_partial)
     torch.testing.assert_close(output.cpu(), ref_out.cpu(), atol=0.004,
                                rtol=0.004)
+
+
+@pytest.mark.parametrize("heads,page_size", [(3, 256), (3, 512),
+                                               (6, 256), (6, 512)])
+def test_attention_m1_token_pairs_live_masks_and_graph(native, heads,
+                                                        page_size):
+    # Independently gather only valid slots, then use CPU FP32 softmax/PV.
+    # The same graph must handle either member of a read pair being invalid,
+    # absent pages/requests and poisoned reusable partials after a long replay.
+    torch.manual_seed(1823 + heads + page_size)
+    q = torch.randn(1, heads, 256, dtype=torch.float16, device="xpu")
+    packed = torch.randn(2, 1, page_size, 512, dtype=torch.float16,
+                         device="xpu")
+    table = torch.tensor([[0, 1, -1, 2]], dtype=torch.int32, device="xpu")
+    requests = torch.zeros(1, dtype=torch.int32, device="xpu")
+    indices = torch.zeros(1, 2051, dtype=torch.int32, device="xpu")
+    output = torch.empty_like(q)
+    partials = torch.empty(1, heads, 43, 258, device="xpu")
+
+    def run():
+        native.token_split_attention_v3(q, packed, indices, table, requests,
+                                         page_size, output, partials)
+
+    run()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        run()
+    counts = (2051, 0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+              2049, 2050, 2051)
+    for step, count in enumerate(counts):
+        logical = (torch.arange(count, dtype=torch.int32) * 19) % (
+            page_size * 4)
+        logical[step % 2::7] = -1
+        row = torch.full((1, 2051), -1, dtype=torch.int32)
+        row[0, :count] = logical
+        indices.copy_(row)
+        request = -1 if step in (3, 8) else 1 if step == 10 else 0
+        requests.fill_(request)
+        table[0, 0] = -1 if step % 3 == 0 else 0
+        q.add_(0.001)
+        partials.fill_(float("nan"))
+        graph.replay()
+        expected = torch.zeros_like(q.cpu())
+        if request == 0:
+            logical = logical[logical >= 0].long()
+            physical = table.cpu()[0, logical // page_size].long()
+            valid = (physical >= 0) & (physical < packed.size(0))
+            logical, physical = logical[valid], physical[valid]
+            if logical.numel():
+                kv = packed.cpu()[physical, 0, logical % page_size].float()
+                scores = q.cpu()[0].float() @ kv[:, :256].T * 0.0625
+                expected[0] = (torch.softmax(scores, -1) @ kv[:, 256:]).half()
+        torch.testing.assert_close(output.cpu(), expected, atol=0.004,
+                                   rtol=0.004)
 
 
 def test_attention_full_graph_replays_overallocated_page_table(native):
@@ -422,13 +483,14 @@ def test_attention_rejects_workspace_alias_before_write(native):
     assert bool((output == 7).all())
 
 
-def test_attention_nondefault_stream_drop_inputs(native):
+@pytest.mark.parametrize("rows,heads", [(1, 3), (1, 6), (2, 6)])
+def test_attention_nondefault_stream_drop_inputs(native, rows, heads):
     stream = torch.xpu.Stream()
     with torch.xpu.stream(stream):
-        case = attention_case(2, 6, 1024, 256)
+        case = attention_case(rows, heads, 1024, 256)
         expected = attention_golden(case)
         output = torch.empty_like(case[0])
-        partials = torch.empty(2, 6, 43, 258, dtype=torch.float32,
+        partials = torch.empty(rows, heads, 43, 258, dtype=torch.float32,
                                device="xpu")
         native.token_split_attention_v3(*case, 256, output, partials)
         del case
@@ -1547,3 +1609,174 @@ def test_rejected_calls_submit_no_xpu_kernel(native):
     submitted = [event for event in profiler.events()
                  if event.device_type == torch.autograd.DeviceType.XPU]
     assert submitted == []
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("capacity", [4095, 65535, 256000])
+def test_selection_full_graph_live_range_keeps_score_index_order(
+    native, page_size, capacity
+):
+    case = list(selection_case(1, 256000, page_size))
+    case[7] = capacity
+    # Integer dot products avoid CPU/GPU reduction ambiguity. Repeated scores
+    # force the low logical-index tie rule across live partition boundaries.
+    case[0].zero_()
+    case[0][:, :, 0] = 1
+    case[1].zero_()
+    ranks = torch.arange(
+        case[1].size(0) * page_size, dtype=torch.float32, device="xpu"
+    ).remainder(1024).half()
+    case[1][:, :, 0, 0] = ranks.reshape(case[1].size(0), page_size)
+    case[2].copy_(torch.randperm(
+        case[2].numel(), device="xpu", dtype=torch.int32
+    ).reshape_as(case[2]))
+    native.select_paged_tokens_v2(*case)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        native.select_paged_tokens_v2(*case)
+    lengths = (0, 1, 3, 127, 2047, 2048, 2049, 8191,
+               32767, 131071, capacity)
+    for length in lengths:
+        length = min(length, capacity)
+        case[4].fill_(length - 1)
+        case[5].fill_(length)
+        graph.replay()
+        torch.testing.assert_close(
+            case[8].cpu(), selection_golden(case), atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize(
+    "capacity", [4095, 4096, 65536, 65537, 196608, 196609, 256000]
+)
+def test_selection_graph_reuses_poisoned_scratch_with_padded_holed_cache(
+    native, page_size, capacity
+):
+    case = list(selection_case(1, capacity, page_size))
+    pages = case[1].size(0)
+    backing = torch.full(
+        (pages, page_size, 140), float("nan"),
+        dtype=torch.float16, device="xpu"
+    )
+    case[1] = backing[..., :128].unsqueeze(2)
+    case[1].zero_()
+    ranks = torch.arange(
+        pages * page_size, device="xpu", dtype=torch.int32
+    ).remainder(31).half()
+    case[1][..., 0, 0] = ranks.reshape(pages, page_size)
+    case[0].zero_()
+    case[0][..., 0] = 1
+    case[2].copy_(torch.randperm(
+        pages, device="xpu", dtype=torch.int32
+    ).reshape_as(case[2]))
+    case[2][0, ::7] = -1
+    for tensor in (case[9], case[11]):
+        tensor.fill_(float("nan"))
+    for tensor in (case[10], case[12]):
+        tensor.fill_(0x12345678)
+    table = case[2].cpu()[0]
+    cache = case[1].cpu()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        native.select_paged_tokens_v2(*case)
+    # Crosses the supported raw-score chunk and partition boundaries. Replays
+    # must mask raw scores left behind by a preceding full-length replay.
+    for length in (capacity, 3, min(8191, capacity), 0, capacity - 1, 511):
+        case[4].fill_(length - 1)
+        case[5].fill_(length)
+        graph.replay()
+        blocks = length // 4
+        logical = torch.arange(blocks)
+        physical = table[logical // page_size].long()
+        valid = physical >= 0
+        scores = torch.full((blocks,), -float("inf"))
+        ids = logical.clone()
+        ids[~valid] = -1
+        scores[valid] = cache[
+            physical[valid], logical[valid] % page_size, 0, 0
+        ].float() * 4
+        order = torch.argsort(scores, descending=True, stable=True)[:512]
+        selected = ids[order]
+        tokens = selected[:, None] * 4 + torch.arange(4)
+        tokens[selected < 0] = -1
+        expected = torch.full((1, 2051), -1, dtype=torch.int32)
+        expected[0, :tokens.numel()] = tokens.flatten().int()
+        tail = torch.arange(blocks * 4, length, dtype=torch.int32)
+        expected[0, tokens.numel():tokens.numel() + tail.numel()] = tail
+        torch.testing.assert_close(case[8].cpu(), expected, atol=0, rtol=0)
+    assert torch.isnan(backing[..., 128:]).all()
+
+
+@pytest.mark.parametrize("rows", range(1, 9))
+@pytest.mark.parametrize("page_size,length", [(256, 1024), (512, 8192)])
+def test_qwen4_tp2_attention_two_kv_heads_matches_independent_math(
+    native, rows, page_size, length
+):
+    assert native.qsa_sycl_q12_kv2_abi_version == 1
+    case = attention_case(rows, 12, length, page_size)
+    output = torch.empty_like(case[0])
+    partials = torch.empty(rows, 12, 43, 258, dtype=torch.float32, device="xpu")
+    native.token_split_attention_v3(*case, page_size, output, partials)
+    torch.testing.assert_close(
+        output.cpu(), attention_golden(case), atol=0.004, rtol=0.004
+    )
+
+
+def test_qwen4_tp2_attention_graph_reads_each_live_kv_group(native):
+    case = attention_case(1, 12, 1024, 256)
+    output = torch.empty_like(case[0])
+    partials = torch.empty(1, 12, 43, 258, dtype=torch.float32, device="xpu")
+    native.token_split_attention_v3(*case, 256, output, partials)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        native.token_split_attention_v3(*case, 256, output, partials)
+    case[1][:, 0, :, 256:].fill_(0.25)
+    case[1][:, 1, :, 256:].fill_(-0.75)
+    graph.replay()
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        output[:, :6],
+        torch.full_like(output[:, :6], 0.25),
+        atol=0.001,
+        rtol=0.001,
+    )
+    torch.testing.assert_close(
+        output[:, 6:],
+        torch.full_like(output[:, 6:], -0.75),
+        atol=0.001,
+        rtol=0.001,
+    )
+
+
+def test_qwen4_tp2_attention_rejects_incompatible_kv_before_write(native):
+    case = list(attention_case(1, 12, 1024, 256))
+    case[1] = torch.zeros(4, 1, 256, 512, dtype=torch.float16, device="xpu")
+    output = torch.full_like(case[0], 7)
+    partials = torch.full(
+        (1, 12, 43, 258), 11, dtype=torch.float32, device="xpu"
+    )
+    with pytest.raises(RuntimeError, match="KV=2"):
+        native.token_split_attention_v3(*case, 256, output, partials)
+    assert bool((output == 7).all())
+    assert bool((partials == 11).all())
+
+@pytest.mark.parametrize("rows", [129, 4096])
+def test_qwen4_tp2_attention_prefill_chunk_preserves_each_kv_group(
+    native, rows
+):
+    # Cross the 128-row native scratch tile with an independent constant-V
+    # result; Q/K and merge ordering cannot change either group's expectation.
+    case = attention_case(rows, 12, 128, 256)
+    case[1][:, 0, :, 256:] = 0.25
+    case[1][:, 1, :, 256:] = -0.75
+    output = torch.empty_like(case[0])
+    partials = torch.empty(
+        min(rows, 128), 12, 43, 258, dtype=torch.float32, device="xpu"
+    )
+    native.token_split_attention_v3(*case, 256, output, partials)
+    expected = torch.empty_like(output)
+    expected[:, :6] = 0.25
+    expected[:, 6:] = -0.75
+    torch.testing.assert_close(output, expected, atol=0.001, rtol=0.001)

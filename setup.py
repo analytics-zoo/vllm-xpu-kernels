@@ -103,9 +103,10 @@ class qwen38_bdist_wheel(bdist_wheel):
             for filename in filenames
         )
         has_qwen38 = any(
-            ext.name == "vllm_xpu_kernels._qwen38_C" for ext in extensions
+            ext.name in {"vllm_xpu_kernels._qwen38_C",
+                         "vllm_xpu_kernels._qwen38_fp8_C"} for ext in extensions
         ) or any(
-            Path(filename).name.startswith("_qwen38_C.")
+            Path(filename).name.startswith(("_qwen38_C.", "_qwen38_fp8_C."))
             and filename.endswith(".so") for filename in package_files
         )
         if has_qwen38:
@@ -613,6 +614,8 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
 if _build_custom_ops():
     if _is_enabled("QWEN38_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._qwen38_C",
+                                         py_limited_api=False))
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._qwen38_fp8_C",
                                          py_limited_api=False))
     if _is_enabled("BASIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))

@@ -445,7 +445,7 @@ bool try_forward(sycl::queue& queue, const Inputs& p, const Workspace& w) {
   // The validation boundary is above this line; never return false after it.
   if (router) {
     if (native_block) {
-      const bool wide_router = p.m == 1 && p.intermediate == 160;
+      const bool wide_router = p.m == 1;
       const char* vec_env =
           wide_router ? std::getenv("QWEN38_MOE_M1_ROUTER_VEC") : nullptr;
       const std::string_view vec =
@@ -466,8 +466,14 @@ bool try_forward(sycl::queue& queue, const Inputs& p, const Workspace& w) {
   } else
     launch_topk(queue, p, w, router ? w.logits : p.logits);
   if (native_block) {
-    p.intermediate == 160 ? block::launch_up<160>(queue, p, w)
-                          : block::launch_up<80>(queue, p, w);
+    if (p.m == 1 && p.intermediate == 80) {
+      // TP8 M1 uses one independent subgroup per group. TP4 retains eight:
+      // its stage-only gain did not hold for the complete MoE graph.
+      block::launch_up<80, 1>(queue, p, w);
+    } else {
+      p.intermediate == 160 ? block::launch_up<160>(queue, p, w)
+                            : block::launch_up<80>(queue, p, w);
+    }
     if (p.intermediate == 160) {
       if (p.m == 1) {
         const char* prefetch = std::getenv("QWEN38_MOE_M1_DOWN_PREFETCH");
@@ -479,7 +485,7 @@ bool try_forward(sycl::queue& queue, const Inputs& p, const Workspace& w) {
         block::launch_down<160, 8>(queue, p, w);
       else
         block::launch_down<160, 16>(queue, p, w);
-    } else if (p.m <= 2)
+    } else if (p.m == 2)
       block::launch_down<80, 8>(queue, p, w);
     else
       block::launch_down<80, 16>(queue, p, w);

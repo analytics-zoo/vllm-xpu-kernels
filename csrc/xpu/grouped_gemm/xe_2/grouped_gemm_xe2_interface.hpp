@@ -360,7 +360,14 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     } else if (A_avg_M <= 8) {
       using policy = w4a16_policy_m_16;
       W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 128) {
+    } else if (
+        A_avg_M <= 128 ||
+        (is_B_int4 && A_dtype == at::kHalf && num_experts == 512 &&
+         K == 2560 && (N == 160 || N == 320) && group_size == 128 &&
+         A_total_M <= 81920 && !ptr_bias.has_value())) {
+      // Compact Qwen3.8 gate/up at chunk M<=8192: the generic 128x256
+      // tile pads N320 to512 and overtiles the ~129..160 rows/expert.
+      // Retain the existing 32x64 path without changing dequantization.
       using policy = w4a16_policy_m_32;
       W4A16LauncherCallER(policy);
     } else {

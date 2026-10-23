@@ -125,3 +125,42 @@ def test_bf16_resadd_norm_keeps_large_residual(m):
     assert out.dtype == residual_out.dtype == torch.bfloat16
     torch.testing.assert_close(residual_out, expected_residual, atol=0, rtol=0)
     torch.testing.assert_close(out, _lin(y, w, scale), atol=3e-3, rtol=2e-2)
+
+
+@pytest.mark.parametrize("fusion", ["gated", "resadd", "resadd_pair"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_norm_fp8_gemv_preserves_e4m3_nan_columns(fusion, dtype):
+    """Every fused prologue must use the same NaN-preserving weight decoder."""
+    raw = torch.zeros((256, 128), dtype=torch.uint8)
+    raw[:, 0] = torch.arange(256, dtype=torch.uint8)
+    weight = raw.to(DEVICE).view(torch.float8_e4m3fn)
+    x = torch.ones((1, 128), device=DEVICE, dtype=dtype)
+    scale = torch.ones(1, device=DEVICE)
+    if fusion == "gated":
+        gate = torch.zeros_like(x)
+        norm_weight = torch.ones(128, device=DEVICE, dtype=dtype)
+        outputs = (torch.ops._xpu_C.gated_rmsnorm_fp8_gemm(
+            x, gate, norm_weight, EPS, weight.t(), scale),)
+        # SiLU(0) gives an exact-zero basis; 0 * NaN must remain NaN.
+        basis = torch.zeros((1, 128), dtype=dtype)
+    else:
+        residual = torch.zeros_like(x)
+        norm_weight = torch.zeros(128, device=DEVICE, dtype=dtype)
+        if fusion == "resadd":
+            output, residual_out = torch.ops._xpu_C.resadd_rmsnorm_fp8_gemm(
+                x, residual, norm_weight, EPS, weight.t(), scale)
+            outputs = (output,)
+        else:
+            first, second, residual_out = (
+                torch.ops._xpu_C.resadd_rmsnorm_fp8_gemm_pair(
+                    x, residual, norm_weight, EPS,
+                    weight.t(), scale, weight.t(), scale))
+            outputs = (first, second)
+        torch.testing.assert_close(residual_out, x, atol=0, rtol=0)
+        # rsqrt(1 + EPS) rounds to one in both supported 16-bit dtypes.
+        basis = torch.ones((1, 128), dtype=dtype)
+    reference = (basis.float() @
+                 raw.view(torch.float8_e4m3fn).float().t()).to(dtype)
+    for actual in outputs:
+        torch.testing.assert_close(actual.cpu(), reference,
+                                   atol=0, rtol=0, equal_nan=True)

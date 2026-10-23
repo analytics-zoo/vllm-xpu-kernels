@@ -686,3 +686,35 @@ def test_xe_grouped_gemm_block_fp8_wide_scales(m, n, k, pattern, dtype):
     # the floor is set from the output magnitude instead of using atol=0.
     atol = float(ref.abs().max()) * 2**-8
     torch.testing.assert_close(output, ref, rtol=3e-2, atol=atol)
+
+
+@pytest.mark.parametrize("n", [160, 320])
+@pytest.mark.parametrize("rows", [66048, 81920])
+def test_compact_int4_large_prefill_keeps_signed_group128_and_expert_rows(
+        n, rows):
+    """Large prefill with all 512 experts keeps exact binary math."""
+    counts = torch.full((512,), rows // 512, dtype=torch.int32, device=DEVICE)
+    counts[:rows % 512] += 1
+    factors = (torch.arange(rows, device=DEVICE) % 3 + 1).half()
+    x = torch.empty(rows, 2560, device=DEVICE, dtype=torch.float16)
+    x[:, ::2] = factors[:, None] / 8
+    x[:, 1::2] = -factors[:, None] / 16
+    weight = torch.full((512, n, 1280), -15, device=DEVICE,
+                        dtype=torch.int8)  # 0xF1: +1,-1 signed S4.
+    weight[1::2].fill_(31)  # 0x1F reverses both signs.
+    # Match the compact loader's final-expert scale tail guard.
+    backing = torch.zeros(512 * n + (-n % 256), 20,
+                          device=DEVICE, dtype=torch.float16)
+    scales = backing[:512 * n].view(512, n, 20)
+    columns = (torch.arange(n, device=DEVICE) % 3 + 1).float()
+    groups = torch.pow(2., (torch.arange(20, device=DEVICE) % 3 - 8).float())
+    scales.copy_((columns[:, None] * groups[None, :])[None, :])
+    output = torch.empty(rows, n, device=DEVICE, dtype=torch.float16)
+    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+        x, None, weight, scales, None, output, counts, n, 2560, 512)
+    signs = (1 - 2 * (torch.arange(512, device=DEVICE) % 2)).float()
+    row_sign = torch.repeat_interleave(signs, counts.long(), output_size=rows)
+    # Every128-wide group has64 pairs: (1/8 + 1/16) *64 =12.
+    expected = (12 * factors.float() * row_sign * groups.sum())[:, None]
+    expected = (expected * columns[None, :]).half()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)

@@ -23,4 +23,10 @@ void int4_linear_fused2(
     const torch::Tensor& scale1,
     torch::Tensor& output1);
 
+bool int4_dense_ba_linear(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& scale,
+    torch::Tensor& output);
+
 }  // namespace vllm::qwen38

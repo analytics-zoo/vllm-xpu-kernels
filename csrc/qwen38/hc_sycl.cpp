@@ -31,7 +31,7 @@ constexpr int kDownMerged = 336;
 constexpr int kSg = 16;
 constexpr int kLocal = 256;
 constexpr int kNormLocal = 512;
-constexpr int kPrefillMaxM = 4096;
+constexpr int kPrefillMaxM = 8192;
 constexpr auto kLoadProperties = sx::properties{
     sx::data_placement_striped,
     sx::contiguous_memory,
@@ -842,7 +842,7 @@ void prefill_grouped_norm(
     torch::Tensor& output,
     double eps) {
   check_norm(input, weight, output, eps, kPrefillMaxM);
-  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..4096");
+  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..8192");
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
   auto& queue = stream.queue();
@@ -867,7 +867,7 @@ void prefill_gate_mix(
     const torch::Tensor& gate,
     torch::Tensor& output) {
   check_gate(input, gate, output, kPrefillMaxM);
-  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..4096");
+  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..8192");
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
   auto& queue = stream.queue();
@@ -884,7 +884,7 @@ void prefill_combine(
     const torch::Tensor& injection,
     torch::Tensor& output) {
   check_combine(hidden, block, injection, output, kPrefillMaxM);
-  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..4096");
+  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..8192");
   const c10::DeviceGuard guard(hidden.device());
   const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
   auto& queue = stream.queue();
@@ -911,7 +911,7 @@ void prefill_combine_norm(
     double eps) {
   check_combine(hidden, block, injection, combined, kPrefillMaxM);
   check_norm(hidden, weight, normed, eps, kPrefillMaxM);
-  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..4096");
+  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..8192");
   check_distinct_outputs(
       {&combined, &normed}, {&hidden, &block, &injection, &weight});
   const c10::DeviceGuard guard(hidden.device());

@@ -72,3 +72,30 @@ def test_bf16_gemv_preserves_values_outside_fp16_range(value):
     out = torch.ops._xpu_C.fp8_gemm_w8a16(x, w.t(), scale, None)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out, x[:, :1].expand(1, 16), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("pair", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fp8_gemv_all_encodings_preserve_nan_and_finite_values(pair, dtype):
+    """The automatic M1 path must keep both E4M3 NaNs and finite values."""
+    raw = torch.zeros((256, 64), dtype=torch.uint8)
+    raw[:, 0] = torch.arange(256, dtype=torch.uint8)
+    weight = raw.to(DEVICE).view(torch.float8_e4m3fn)
+    x = torch.zeros((1, 64), device=DEVICE, dtype=dtype)
+    x[:, 0] = 1
+    scale = torch.ones(1, device=DEVICE)
+    expected = raw[:, :1].contiguous().view(torch.float8_e4m3fn)
+    expected = expected.float().to(dtype).t().contiguous()
+    if pair:
+        second = raw.flip(0).to(DEVICE).view(torch.float8_e4m3fn)
+        first_out, second_out = torch.ops._xpu_C.fp8_gemm_w8a16_pair(
+            x, weight.t(), scale, second.t(), scale)
+        outputs = (first_out, second_out)
+        references = (expected, expected.flip(1))
+    else:
+        outputs = (torch.ops._xpu_C.fp8_gemm_w8a16(
+            x, weight.t(), scale, None),)
+        references = (expected,)
+    for actual, reference in zip(outputs, references):
+        torch.testing.assert_close(actual.cpu(), reference,
+                                   atol=0, rtol=0, equal_nan=True)

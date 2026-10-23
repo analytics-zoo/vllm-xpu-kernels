@@ -1,6 +1,8 @@
 #include <sycl/sycl.hpp>
 
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <ATen/DeviceGuard.h>
 #include "utils.h"
 #include "dispatch_utils.h"
@@ -251,6 +253,30 @@ void launch_qkv_split_norm_rope(
 
 }  // namespace vllm
 
+namespace {
+void qkv_check_tensor(const torch::Tensor& tensor, const torch::Tensor& qkv) {
+  TORCH_CHECK(
+      tensor.is_xpu() && tensor.device() == qkv.device() &&
+          tensor.layout() == at::kStrided && !tensor.is_neg() &&
+          !tensor.is_conj(),
+      "qkv_split_norm_rope: tensors must be same-device XPU strided tensors "
+      "without lazy negation/conjugation");
+}
+
+bool qkv_overlaps(const torch::Tensor& a, const torch::Tensor& b) {
+  if (a.numel() == 0 || b.numel() == 0) return false;
+  auto span = [](const torch::Tensor& tensor) {
+    int64_t last = 0;
+    for (int64_t d = 0; d < tensor.dim(); ++d)
+      last += (tensor.size(d) - 1) * tensor.stride(d);
+    return static_cast<uintptr_t>((last + 1) * tensor.element_size());
+  };
+  const auto pa = reinterpret_cast<uintptr_t>(a.const_data_ptr());
+  const auto pb = reinterpret_cast<uintptr_t>(b.const_data_ptr());
+  return pa <= pb ? pb - pa < span(a) : pa - pb < span(b);
+}
+}  // namespace
+
 void qkv_split_norm_rope(
     const torch::Tensor& qkv,                      // [T, W]
     const torch::Tensor& positions,                // int64 [T] or [3, T]
@@ -268,7 +294,19 @@ void qkv_split_norm_rope(
     double weight_offset,
     std::vector<int64_t> mrope_section,
     bool mrope_interleaved) {
-  const at::DeviceGuard device_guard(qkv.device());
+  for (const torch::Tensor* tensor :
+       {&qkv,
+        &positions,
+        &q_weight,
+        &k_weight,
+        &cos_sin_cache,
+        static_cast<const torch::Tensor*>(&q_out),
+        static_cast<const torch::Tensor*>(&k_out)})
+    qkv_check_tensor(*tensor, qkv);
+  if (gate_out) qkv_check_tensor(*gate_out, qkv);
+  TORCH_CHECK(
+      num_q_heads > 0 && num_kv_heads > 0,
+      "qkv_split_norm_rope: head counts must be positive");
   const auto dtype = qkv.scalar_type();
   TORCH_CHECK(
       dtype == at::kHalf || dtype == at::kBFloat16,
@@ -291,8 +329,15 @@ void qkv_split_norm_rope(
           (rotary_dim / 2) % epl == 0,
       "qkv_split_norm_rope: unsupported rotary_dim");
   TORCH_CHECK(
-      qkv.dim() == 2 && qkv.stride(1) == 1,
+      qkv.dim() == 2 && qkv.stride(1) == 1 && qkv.stride(0) >= qkv.size(1),
       "qkv_split_norm_rope: qkv must be 2D with unit inner stride");
+  // Bound head counts before any products, including int64 width/numel
+  // arithmetic and the kernel's int head indices.
+  TORCH_CHECK(
+      num_q_heads <= qkv.size(1) / head_dim &&
+          num_kv_heads <= qkv.size(1) / head_dim &&
+          num_q_heads <= std::numeric_limits<int>::max() - num_kv_heads,
+      "qkv_split_norm_rope: head counts exceed qkv row capacity");
   const bool gated = gate_out.has_value();
   const int64_t T = qkv.size(0);
   TORCH_CHECK(
@@ -307,10 +352,14 @@ void qkv_split_norm_rope(
   } else {
     TORCH_CHECK(
         positions.dim() == 2 && positions.size(0) == 3 &&
-            positions.size(1) == T && positions.stride(1) == 1,
+            positions.size(1) == T && positions.stride(1) == 1 &&
+            positions.stride(0) >= T,
         "qkv_split_norm_rope: positions must be [T] or [3, T]");
     TORCH_CHECK(
-        mrope_section.size() == 3 &&
+        mrope_section.size() == 3 && mrope_section[0] >= 0 &&
+            mrope_section[0] <= rotary_dim / 2 && mrope_section[1] >= 0 &&
+            mrope_section[1] <= rotary_dim / 2 && mrope_section[2] >= 0 &&
+            mrope_section[2] <= rotary_dim / 2 &&
             mrope_section[0] + mrope_section[1] + mrope_section[2] ==
                 rotary_dim / 2,
         "qkv_split_norm_rope: mrope_section must have 3 entries summing to "
@@ -333,6 +382,21 @@ void qkv_split_norm_rope(
         gate_out->numel() == T * num_q_heads * head_dim);
   }
 
+  const std::array<const torch::Tensor*, 3> outputs{
+      &q_out, &k_out, gate_out ? &*gate_out : nullptr};
+  const size_t num_outputs = gate_out ? 3 : 2;
+  for (size_t i = 0; i < num_outputs; ++i) {
+    for (const torch::Tensor* input :
+         {&qkv, &positions, &q_weight, &k_weight, &cos_sin_cache})
+      TORCH_CHECK(
+          !qkv_overlaps(*outputs[i], *input),
+          "qkv_split_norm_rope: outputs must not overlap any input");
+    for (size_t j = 0; j < i; ++j)
+      TORCH_CHECK(
+          !qkv_overlaps(*outputs[i], *outputs[j]),
+          "qkv_split_norm_rope: outputs must not overlap each other");
+  }
+  const at::DeviceGuard device_guard(qkv.device());
   VLLM_DISPATCH_HALF_TYPES(dtype, "qkv_split_norm_rope", [&] {
     if (head_dim == 256) {
       vllm::launch_qkv_split_norm_rope<scalar_t, 256>(

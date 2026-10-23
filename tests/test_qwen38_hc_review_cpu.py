@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 SOURCE = (Path(__file__).resolve().parents[1] /
           "csrc/qwen38/hc_sycl.cpp").read_text()
 
@@ -44,8 +43,13 @@ def test_cpu_hc_large_row_stride_is_not_narrowed_to_int(width):
     if width == 4:
         manual = (Path(__file__).resolve().parents[1] /
                   "csrc/qwen38/hc_norm_m1_manual.h").read_text()
-        assert SOURCE.count("int64_t injection_stride,") == 2
-        assert manual.count("int64_t injection_stride,") == 2
+        for source in (SOURCE, manual):
+            declarations = [line.strip() for line in source.splitlines()
+                            if line.strip().endswith("injection_stride,")
+                            and line.strip() != "injection_stride,"]
+            assert len(declarations) >= 2
+            assert all(line == "int64_t injection_stride,"
+                       for line in declarations)
     else:
         assert "int64_t input_stride," in SOURCE
 

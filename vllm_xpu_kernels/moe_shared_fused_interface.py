@@ -22,6 +22,26 @@ _ROUTER_MAX_EXPERTS = 512
 _ROUTER_MAX_TOP_K = 16
 
 
+def _byte_ranges_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Check positive-stride byte spans, including distinct Storage owners.
+
+    Storage identity would incorrectly reject disjoint parameter views in a
+    shared flat buffer. Refresh validates layout/strides before this helper.
+    """
+    if a.device != b.device or a.numel() == 0 or b.numel() == 0:
+        return False
+
+    def span(tensor: torch.Tensor) -> tuple[int, int]:
+        start = tensor.data_ptr()
+        extent = 1 + sum((size - 1) * stride for size, stride in
+                         zip(tensor.shape, tensor.stride()))
+        return start, start + extent * tensor.element_size()
+
+    a0, a1 = span(a)
+    b0, b1 = span(b)
+    return a0 < b1 and b0 < a1
+
+
 def is_available() -> bool:
     """Whether this build provides the fused decode op."""
     try:
@@ -80,8 +100,10 @@ def supports(
     return (is_available()
             and hidden_states_dtype in (torch.float16, torch.bfloat16)
             and weight_dtype == torch.float8_e4m3fn
-            and num_tokens * top_k <= _MAX_ROUTED_ROWS
-            and hidden_size % 16 == 0 and intermediate_size % 8 == 0)
+            and 1 <= num_tokens * top_k <= _MAX_ROUTED_ROWS
+            and num_tokens > 0 and top_k > 0
+            and hidden_size > 0 and hidden_size % 16 == 0
+            and intermediate_size > 0 and intermediate_size % 8 == 0)
 
 
 def moe_shared_fused_workspace_bytes(
@@ -94,7 +116,9 @@ def moe_shared_fused_workspace_bytes(
 ) -> int:
     """Workspace size in bytes; must match the carve-out in the C++ op."""
     rows = num_tokens * top_k
-    umt = min(rows, num_experts)
+    # One expert may require several M-tiles (e.g. M=16, tile_m=8).
+    # The tile map has at most one tile per routed row.
+    umt = rows
 
     def align(b: int) -> int:
         return (b + 255) // 256 * 256
@@ -108,7 +132,7 @@ def moe_shared_fused_workspace_bytes(
 
 
 class XpuMoESharedFusedDecode:
-    """Holds the weights of one MoE block and a per-M persistent workspace.
+    """Holds weights and persistent workspace per device, stream and M.
 
     Weight layouts:
       w13 [E, H, 2I] fp8-e4m3, w13_scales [E] fp32
@@ -153,14 +177,109 @@ class XpuMoESharedFusedDecode:
         self.top_k = top_k
         self.num_experts = w13.shape[0]
         self.tile_m = tile_m
-        self._ws: dict[int, torch.Tensor] = {}
+        self._ws: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
         self.router_weight = (router_weight.contiguous()
                               if router_weight is not None else None)
         self.renormalize = renormalize
-        self._routing: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._routing: dict[tuple[str, int | None, int, int],
+                            tuple[torch.Tensor, ...]] = {}
+
+    @staticmethod
+    def _cache_key(num_tokens: int,
+                   device: torch.device) -> tuple[str, int | None, int, int]:
+        device = torch.device(device)
+        if device.type == "xpu":
+            stream = torch.xpu.current_stream(device)
+            return (device.type, int(stream.device_index),
+                    int(stream.stream_id), num_tokens)
+        return device.type, device.index, 0, num_tokens
+
+    def refresh_weights(
+        self,
+        w13: torch.Tensor,
+        w13_scales: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scales: torch.Tensor,
+        shared_w13: torch.Tensor,
+        shared_w13_scale: torch.Tensor,
+        shared_w2: torch.Tensor,
+        shared_w2_scale: torch.Tensor,
+        shared_gate: torch.Tensor,
+        router_weight: torch.Tensor | None = None,
+        *,
+        top_k: int | None = None,
+        renormalize: bool | None = None,
+    ) -> None:
+        """Refresh live weights without changing captured tensor addresses.
+
+        Complete metadata/alias validation precedes all writes. The caller
+        must finish an in-flight forward before reloading model weights.
+        """
+        if top_k is not None and top_k != self.top_k:
+            raise ValueError("refresh_weights cannot change top_k")
+        if renormalize is not None and renormalize != self.renormalize:
+            raise ValueError("refresh_weights cannot change renormalize")
+        if (router_weight is None) != (self.router_weight is None):
+            raise ValueError("refresh_weights router_weight presence changed")
+        updates = [
+            ("w13", self.w13, w13),
+            ("w13_scales", self.w13_scales, w13_scales),
+            ("w2", self.w2, w2),
+            ("w2_scales", self.w2_scales, w2_scales),
+            ("shared_w13", self.shared_w13, shared_w13),
+            ("shared_w13_scale", self.shared_w13_scale, shared_w13_scale),
+            ("shared_w2", self.shared_w2, shared_w2),
+            ("shared_w2_scale", self.shared_w2_scale, shared_w2_scale),
+            ("shared_gate", self.shared_gate, shared_gate),
+        ]
+        if self.router_weight is not None:
+            assert router_weight is not None
+            updates.append(("router_weight", self.router_weight, router_weight))
+        copies = []
+        for name, destination, source in updates:
+            if (not isinstance(source, torch.Tensor)
+                    or source.device != destination.device
+                    or source.dtype != destination.dtype
+                    or source.layout != torch.strided or source.is_neg()
+                    or source.is_conj()):
+                raise ValueError(f"refresh_weights invalid {name} metadata")
+            if name in ("shared_w13_scale", "shared_w2_scale"):
+                if source.numel() != 1:
+                    raise ValueError(f"refresh_weights invalid {name} shape")
+                source = source.reshape(1)
+            elif name == "shared_gate":
+                if tuple(source.shape) not in ((self.w13.shape[1], ),
+                                              (1, self.w13.shape[1])):
+                    raise ValueError(
+                        "refresh_weights invalid shared_gate shape")
+                source = source.reshape(-1)
+            if source.shape != destination.shape:
+                raise ValueError(f"refresh_weights invalid {name} shape")
+            if any(stride <= 0 for size, stride in zip(source.shape,
+                                                       source.stride())
+                   if size > 1):
+                raise ValueError(f"refresh_weights invalid {name} strides")
+            same_view = (source.data_ptr() == destination.data_ptr()
+                         and source.stride() == destination.stride())
+            if not same_view and _byte_ranges_overlap(source, destination):
+                raise ValueError(f"refresh_weights overlapping {name} views")
+            if not same_view:
+                copies.append((destination, source))
+        # A source must not be overwritten by another pending update. This
+        # also catches swapped/partially overlapping cached parameter views.
+        for destination, source in copies:
+            for _, other, _ in updates:
+                if (other is not destination
+                        and _byte_ranges_overlap(source, other)):
+                    raise ValueError(
+                        "refresh_weights sources overlap cached weights")
+        with torch.no_grad():
+            for destination, source in copies:
+                destination.copy_(source)
 
     def workspace(self, num_tokens: int, device: torch.device) -> torch.Tensor:
-        ws = self._ws.get(num_tokens)
+        key = self._cache_key(num_tokens, device)
+        ws = self._ws.get(key)
         if ws is None:
             nbytes = moe_shared_fused_workspace_bytes(
                 num_tokens,
@@ -171,7 +290,7 @@ class XpuMoESharedFusedDecode:
                 self.w2.shape[1],
             )
             ws = torch.empty(nbytes, dtype=torch.uint8, device=device)
-            self._ws[num_tokens] = ws
+            self._ws[key] = ws
         return ws
 
     def forward(
@@ -208,7 +327,7 @@ class XpuMoESharedFusedDecode:
         """Softmax top-k routing of hidden_states with router_weight.
 
         Returns (topk_weights fp32, topk_ids int32), [M, top_k] each; the
-        buffers are reused across calls with the same M.
+        buffers are reused on the same device and stream for the same M.
         """
         assert self.router_weight is not None, "no router_weight given"
         logits, topk_weights, topk_ids = self._routing_buffers(
@@ -225,7 +344,8 @@ class XpuMoESharedFusedDecode:
 
     def _routing_buffers(self, m: int,
                          device: torch.device) -> tuple[torch.Tensor, ...]:
-        bufs = self._routing.get(m)
+        key = self._cache_key(m, device)
+        bufs = self._routing.get(key)
         if bufs is None:
             bufs = (
                 torch.empty(m,
@@ -235,7 +355,7 @@ class XpuMoESharedFusedDecode:
                 torch.empty(m, self.top_k, dtype=torch.float32, device=device),
                 torch.empty(m, self.top_k, dtype=torch.int32, device=device),
             )
-            self._routing[m] = bufs
+            self._routing[key] = bufs
         return bufs
 
     def forward_routed(

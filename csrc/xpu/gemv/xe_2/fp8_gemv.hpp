@@ -131,19 +131,29 @@ static inline uint16_t e4m3_bf16(uint32_t byte) {
 }
 
 // Four E4M3 bytes -> 16-bit pairs: even = {0, 2}, odd = {1, 3}.
-template <typename Scalar = sycl::half>
+template <typename Scalar = sycl::half, bool PreserveNan = true>
 static inline uint32_t e4m3_even(uint32_t v) {
-  if constexpr (std::is_same_v<Scalar, sycl::half>)
+  if constexpr (std::is_same_v<Scalar, sycl::half>) {
+    if constexpr (PreserveNan) {
+      const uint32_t magnitude = v & 0x007F007Fu;
+      const uint32_t nan = (magnitude + 0x00010001u) & 0x00800080u;
+      return ((v & 0x00800080u) << 8) | ((magnitude | nan) << 7);
+    }
     return ((v & 0x00800080u) << 8) | ((v & 0x007F007Fu) << 7);
-  else
+  } else
     return uint32_t(e4m3_bf16(v & 0xffu)) |
            (uint32_t(e4m3_bf16((v >> 16) & 0xffu)) << 16);
 }
-template <typename Scalar = sycl::half>
+template <typename Scalar = sycl::half, bool PreserveNan = true>
 static inline uint32_t e4m3_odd(uint32_t v) {
-  if constexpr (std::is_same_v<Scalar, sycl::half>)
+  if constexpr (std::is_same_v<Scalar, sycl::half>) {
+    if constexpr (PreserveNan) {
+      const uint32_t magnitude = v & 0x7F007F00u;
+      const uint32_t nan = (magnitude + 0x01000100u) & 0x80008000u;
+      return (v & 0x80008000u) | ((magnitude | nan) >> 1);
+    }
     return (v & 0x80008000u) | ((v & 0x7F007F00u) >> 1);
-  else
+  } else
     return uint32_t(e4m3_bf16((v >> 8) & 0xffu)) |
            (uint32_t(e4m3_bf16(v >> 24)) << 16);
 }
@@ -260,7 +270,7 @@ struct SlmA {
 };
 
 // ----------------------------------------------------------- compute -----
-template <int MP, typename Scalar>
+template <int MP, typename Scalar, bool PreserveNan = true>
 static inline void compute_chunk(
     const u32x8 (&wr)[kChunkSteps],
     const AOps<MP>& A,
@@ -272,8 +282,8 @@ static inline void compute_chunk(
     cute::intel::int8 be, bo;
   #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      be[i] = int(e4m3_even<Scalar>(wr[t][i]));
-      bo[i] = int(e4m3_odd<Scalar>(wr[t][i]));
+      be[i] = int(e4m3_even<Scalar, PreserveNan>(wr[t][i]));
+      bo[i] = int(e4m3_odd<Scalar, PreserveNan>(wr[t][i]));
     }
     Dpas<MP, Scalar>::mma(acc_even, A.e[t], be);
     Dpas<MP, Scalar>::mma(acc_odd, A.o[t], bo);
@@ -320,7 +330,8 @@ template <
     class ALoad,
     int PRE = 1,
     int CPS = 0,
-    typename Scalar = sycl::half>
+    typename Scalar = sycl::half,
+    bool PreserveNan = true>
 static inline void gemv_body(
     const sycl::nd_item<1>& item,
     const Seg<Scalar>& seg,
@@ -348,7 +359,7 @@ static inline void gemv_body(
   auto step = [&](int it, int c, const u32x8(&wr)[kChunkSteps]) {
     AOps<MP> A;
     load_a_fn(sg, c * kChunkK, it, A);
-    compute_chunk<MP, Scalar>(wr, A, acc_e, acc_o);
+    compute_chunk<MP, Scalar, PreserveNan>(wr, A, acc_e, acc_o);
   };
   if (active) {
     if constexpr (CPS > 0) {

@@ -29,6 +29,8 @@
  * kMoeSharedFusedTileM16); the interface resolves 0 (auto) before calling.
  **************************************************************************************************/
 #include <torch/all.h>
+#include <ATen/DeviceGuard.h>
+#include <cstdint>
 #include <c10/xpu/XPUStream.h>
 
 #include <cute/tensor.hpp>
@@ -238,12 +240,18 @@ class SpGatherLauncher {
       ElementA* a_perm) {
     // One element per work-item, 2D grid (route, K-chunk of 4) so the
     // work-item indices need no integer division; R*K fully-coalesced.
+    // H is a multiple of 16, not necessarily 256. Pad the chunk grid to
+    // whole work-groups; extra work-items must not touch any tensor.
+    const int chunks = K / 4;
+    const int global_chunks = ceil_div(chunks, 64) * 64;
     q.submit([&](sycl::handler& cgh) {
       cgh.parallel_for<SpGatherName<ElementA>>(
-          sycl::nd_range<2>(sycl::range<2>(R, K / 4), sycl::range<2>(1, 64)),
+          sycl::nd_range<2>(
+              sycl::range<2>(R, global_chunks), sycl::range<2>(1, 64)),
           [=](sycl::nd_item<2> item) {
             const int r = item.get_global_id(0);
             const int c = item.get_global_id(1) * 4;
+            if (c >= K) return;
             const int dst = perm_pos[r];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -508,6 +516,28 @@ class SpFinalizeLauncher {
 // ---------------------------------------------------------------------------
 // Host wrapper: the whole fused forward in one op.
 // ---------------------------------------------------------------------------
+void check_tensor(const torch::Tensor& tensor, const torch::Tensor& x) {
+  TORCH_CHECK(
+      tensor.is_xpu() && tensor.device() == x.device() &&
+          tensor.layout() == at::kStrided && tensor.is_contiguous() &&
+          !tensor.is_neg() && !tensor.is_conj(),
+      "moe_shared_fused_decode: tensors must be contiguous same-device XPU "
+      "tensors without lazy negation/conjugation");
+}
+
+bool overlaps(const torch::Tensor& a, const torch::Tensor& b) {
+  if (a.numel() == 0 || b.numel() == 0) return false;
+  const auto pa = reinterpret_cast<uintptr_t>(a.const_data_ptr());
+  const auto pb = reinterpret_cast<uintptr_t>(b.const_data_ptr());
+  return pa <= pb ? pb - pa < a.numel() * a.element_size()
+                  : pa - pb < b.numel() * b.element_size();
+}
+
+bool same_view(const torch::Tensor& a, const torch::Tensor& b) {
+  return a.scalar_type() == b.scalar_type() && a.sizes() == b.sizes() &&
+         a.strides() == b.strides() && a.const_data_ptr() == b.const_data_ptr();
+}
+
 inline int32_t* iptr(uint8_t* base, int64_t byte_off) {
   return reinterpret_cast<int32_t*>(base + byte_off);
 }
@@ -533,6 +563,26 @@ void moe_shared_fused_decode_xe2_impl(
     torch::Tensor& ws,
     int64_t tile_m) {
   using namespace moe_shared_fused;
+  for (const auto* tensor :
+       {&x,
+        &topk_ids,
+        &topk_weights,
+        &w13,
+        &w13_scale,
+        &w2,
+        &w2_scale,
+        &shared_w13_t,
+        &shared_w13_scale_t,
+        &shared_w2_t,
+        &shared_w2_scale_t,
+        &shared_gate_t,
+        static_cast<const torch::Tensor*>(&output),
+        static_cast<const torch::Tensor*>(&ws)})
+    check_tensor(*tensor, x);
+  TORCH_CHECK(
+      x.dim() == 2 && w13.dim() == 3 && w2.dim() == 3 && topk_ids.dim() == 2,
+      "moe_shared_fused_decode: expected x [M,H], ids [M,top_k], "
+      "w13 [E,H,2I], w2 [E,I,H]");
   constexpr const char* kRecipe =
       "moe_shared_fused_decode only supports fp16/bf16 activations + fp8-e4m3 "
       "per-tensor weights: ";
@@ -578,15 +628,17 @@ void moe_shared_fused_decode_xe2_impl(
   TORCH_CHECK(output.sizes() == x.sizes(), "output must match x");
   TORCH_CHECK(topk_ids.dim() == 2 && topk_ids.is_contiguous());
   TORCH_CHECK(
-      topk_weights.sizes() == topk_ids.sizes() && topk_weights.is_contiguous());
+      topk_weights.sizes() == topk_ids.sizes() &&
+          topk_weights.is_contiguous() && topk_ids.size(0) == x.size(0),
+      "moe_shared_fused_decode: routing shapes must match [M,top_k]");
   TORCH_CHECK(w13.is_contiguous() && w2.is_contiguous());
   TORCH_CHECK(
       shared_w13_t.is_contiguous() && shared_w2_t.is_contiguous() &&
           shared_gate_t.is_contiguous(),
       "shared weights must be contiguous");
   TORCH_CHECK(
-      w13.size(1) == x.size(1) && w2.size(2) == x.size(1) &&
-          w13.size(2) == 2 * w2.size(1),
+      w13.size(0) == w2.size(0) && w13.size(1) == x.size(1) &&
+          w2.size(2) == x.size(1) && w13.size(2) == 2 * w2.size(1),
       "routed weight shapes must be w13 [E, H, 2I], w2 [E, I, H]");
   TORCH_CHECK(
       shared_w13_t.dim() == 2 && shared_w13_t.size(0) == w13.size(1) &&
@@ -604,6 +656,12 @@ void moe_shared_fused_decode_xe2_impl(
   const c10::optional<torch::Tensor> shared_w2_scale = shared_w2_scale_t;
   const c10::optional<torch::Tensor> shared_gate = shared_gate_t;
 
+  TORCH_CHECK(
+      x.size(0) > 0 && x.size(0) <= MAX_R && x.size(1) > 0 && w2.size(1) > 0 &&
+          w13.size(0) > 0 && topk_ids.size(1) > 0 &&
+          topk_ids.size(1) <= MAX_R / x.size(0),
+      "moe_shared_fused_decode: dimensions must be positive and "
+      "num_tokens * top_k must not exceed 512");
   const int num_tokens = x.size(0);
   const int H = x.size(1);
   const int top_k = topk_ids.size(1);
@@ -624,12 +682,13 @@ void moe_shared_fused_decode_xe2_impl(
            shared_gate->scalar_type() == x.scalar_type()),
       "shared expert weight/scale dtypes");
 
-  const int umt = R < E ? R : E;
+  // Each expert can occupy several M-tiles. There are at most R tiles,
+  // including when E < R (e.g. M=16, E=1, tile_m=8).
+  const int umt = R;
   const int M_s = num_tokens;
 
   // ---- ONE flat byte workspace (allocated once per batch size by the
   // Python side): [int32 map arrays][w_perm fp32][gate fp32][fp16 buffers]
-  uint8_t* wsb = reinterpret_cast<uint8_t*>(ws.data_ptr());
   const int64_t o_int = 0;
   const int64_t o_wperm = align256(o_int + 4 * (3 * umt + 1 + R));
   const int64_t o_gate = align256(o_wperm + 4 * R);
@@ -640,6 +699,36 @@ void moe_shared_fused_decode_xe2_impl(
   int64_t o_sh2 = o_d2 + (int64_t)R * N2 * 2;
   int64_t htotal = o_sh2 + (int64_t)M_s * N2 * 2;
   TORCH_CHECK(ws.numel() >= htotal, "workspace too small");
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(ws.const_data_ptr()) % 16 == 0,
+      "moe_shared_fused_decode: workspace must be 16-byte aligned");
+  for (const auto* input :
+       {&x,
+        &topk_ids,
+        &topk_weights,
+        &w13,
+        &w13_scale,
+        &w2,
+        &w2_scale,
+        &shared_w13_t,
+        &shared_w13_scale_t,
+        &shared_w2_t,
+        &shared_w2_scale_t,
+        &shared_gate_t}) {
+    TORCH_CHECK(
+        !overlaps(ws, *input),
+        "moe_shared_fused_decode: workspace must not overlap inputs");
+    // All input reads finish before the final output kernel. Retain the
+    // canonical output==x case, but reject partial aliases and weight writes.
+    TORCH_CHECK(
+        !overlaps(output, *input) || (input == &x && same_view(output, x)),
+        "moe_shared_fused_decode: output must not overlap inputs except x");
+  }
+  TORCH_CHECK(
+      !overlaps(output, ws),
+      "moe_shared_fused_decode: output must not overlap workspace");
+  const at::DeviceGuard device_guard(x.device());
+  uint8_t* wsb = reinterpret_cast<uint8_t*>(ws.data_ptr());
 
   int32_t* mt_expert = iptr(wsb, o_int);
   int32_t* mt_row_base = iptr(wsb, o_int + 4 * umt);

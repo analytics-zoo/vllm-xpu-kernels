@@ -10,9 +10,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-
-OPS = ("gdn_decode_sycl", "gdn_spec_v2_sycl", "gdn_norm_gate_sycl",
-       "gdn_norm_int4_sycl")
+OPS = (
+    "gdn_decode_sycl",
+    "gdn_spec_v2_sycl",
+    "gdn_norm_gate_sycl",
+    "gdn_norm_int4_sycl",
+)
 
 
 def load_provider(monkeypatch, available, dispatch=True):
@@ -20,15 +23,23 @@ def load_provider(monkeypatch, available, dispatch=True):
     package = ModuleType(name)
     package.__path__ = []
     monkeypatch.setitem(sys.modules, name, package)
-    monkeypatch.setitem(sys.modules, name + "._qwen38_C", ModuleType("_qwen38_C"))
+    monkeypatch.setitem(
+        sys.modules, name + "._qwen38_C", ModuleType("_qwen38_C")
+    )
     monkeypatch.delenv("QWEN38_SYCL_LIBRARY", raising=False)
-    schemas = Mock(side_effect=lambda name: [object()]
-                   if name.rsplit("::", 1)[1] in available else [])
+    schemas = Mock(
+        side_effect=lambda name: [object()]
+        if name.rsplit("::", 1)[1] in available
+        else []
+    )
     dispatch_probe = Mock(return_value=dispatch)
     monkeypatch.setattr(torch._C, "_jit_get_schemas_for_operator", schemas)
-    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key",
-                        dispatch_probe)
-    path = Path(__file__).resolve().parents[1] / "vllm_xpu_kernels/qwen38_gdn.py"
+    monkeypatch.setattr(
+        torch._C, "_dispatch_has_kernel_for_dispatch_key", dispatch_probe
+    )
+    path = (
+        Path(__file__).resolve().parents[1] / "vllm_xpu_kernels/qwen38_gdn.py"
+    )
     spec = importlib.util.spec_from_file_location(name + ".qwen38_gdn", path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
@@ -68,4 +79,35 @@ def test_geometry_is_not_replaced_by_cached_availability(monkeypatch):
     assert module.has_esimd_gdn_conv_fused_seq(2, 6, 128, 128)
     for shape in ((4, 12, 64, 128), (4, 12, 128, 64), (8, 24, 128, 128)):
         assert not module.has_esimd_gdn_conv_fused_seq(*shape)
-    assert schemas.call_count == 4
+    assert schemas.call_count == 5
+
+
+def test_tp2_geometry_requires_its_native_capability(monkeypatch):
+    module, schemas, _ = load_provider(
+        monkeypatch, (*OPS, "gdn_tp2_sycl_supported")
+    )
+    monkeypatch.setattr(
+        torch.ops._qwen38_C,
+        "gdn_tp2_sycl_supported",
+        lambda: True,
+        raising=False,
+    )
+    assert module.supports_gdn_geometry(8, 24, 128, 128)
+    for _ in range(3):
+        assert module.has_esimd_gdn_conv_fused_seq(8, 24, 128, 128)
+    assert schemas.call_count == 5
+
+
+def test_tp1_geometry_requires_its_native_capability(monkeypatch):
+    module, schemas, _ = load_provider(
+        monkeypatch, (*OPS, "gdn_tp1_sycl_supported")
+    )
+    monkeypatch.setattr(
+        torch.ops._qwen38_C,
+        "gdn_tp1_sycl_supported",
+        lambda: True,
+        raising=False,
+    )
+    assert module.supports_gdn_geometry(16, 48, 128, 128)
+    assert module.has_esimd_gdn_conv_fused_seq(16, 48, 128, 128)
+    assert schemas.call_count == 5

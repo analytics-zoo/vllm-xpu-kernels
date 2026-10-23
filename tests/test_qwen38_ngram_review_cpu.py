@@ -26,7 +26,8 @@ def test_independent_storage_alias_cpu(lookup):
         1,
     )[1]
     assert "check_no_alias(output," in body
-    assert body.index("check_no_alias(output,") < body.index("parallel_for")
+    submission = "launch_host_lookup<" if lookup else "parallel_for"
+    assert body.index("check_no_alias(output,") < body.index(submission)
     assert "output_begin - input_begin < input.nbytes()" in source
     assert "input_begin - output_begin < output.nbytes()" in source
     if lookup:

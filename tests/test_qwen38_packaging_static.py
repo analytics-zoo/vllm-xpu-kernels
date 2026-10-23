@@ -9,7 +9,6 @@ import pytest
 from setuptools import Distribution, Extension, find_packages
 from setuptools.command.bdist_wheel import bdist_wheel
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PROVIDERS = (
     "qwen38.py",
@@ -89,6 +88,8 @@ def test_qwen38_cpython_abi_does_not_change_legacy_extensions():
         for call in extension_calls
     }
     qwen = extensions.pop("vllm_xpu_kernels._qwen38_C")
+    fp8 = extensions.pop("vllm_xpu_kernels._qwen38_fp8_C")
+    assert fp8["py_limited_api"].value is False
     assert isinstance(qwen["py_limited_api"], ast.Constant)
     assert qwen["py_limited_api"].value is False
     assert extensions
@@ -125,7 +126,9 @@ def test_qwen38_cpython_abi_does_not_change_legacy_extensions():
     )[0]
     assert "WITH_SOABI" in qwen_target
     assert "USE_SABI" not in qwen_target
-    assert "LIBRARIES ${QWEN38_TORCH_PYTHON_LIBRARY}" in qwen_target
+    assert "LIBRARIES ${QWEN38_TORCH_PYTHON_LIBRARY}" in " ".join(
+        qwen_target.split()
+    )
 
 
 def _wheel_command_class():
