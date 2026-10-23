@@ -100,6 +100,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("HC_DENSE_GLUE_MAX_M") = qwen4_hc_dense_glue_max_m();
+  module.attr("HC_PREFILL_MAX_M") = 8192;
   module.attr("greedy_argmax_sycl_abi_version") = 1;
   module.attr("greedy_argmax_sycl_tp_sizes") = pybind11::make_tuple(4, 8);
   module.def(

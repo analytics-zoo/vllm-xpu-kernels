@@ -25,7 +25,7 @@ constexpr int kStreams = 4;
 constexpr int kWidth = kHidden * kStreams;
 constexpr int kLocal = 512;
 constexpr int kSg = 16;
-constexpr int kGlueMaxM = 4096;
+constexpr int kGlueMaxM = 8192;
 
 void check_tensor(
     const at::Tensor& value,
@@ -54,7 +54,7 @@ void check_glue_hidden(const at::Tensor& hidden) {
   TORCH_CHECK(
       hidden.is_xpu() && hidden.dim() == 2 && hidden.size(0) >= 1 &&
           hidden.size(0) <= kGlueMaxM,
-      "Qwen4 HC glue supports XPU [M,20480], M=1..4096");
+      "Qwen4 HC glue supports XPU [M,20480], M=1..8192");
   check_tensor(hidden, hidden, {hidden.size(0), kWidth});
 }
 

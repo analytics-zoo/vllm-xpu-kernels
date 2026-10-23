@@ -251,7 +251,8 @@ def test_dense_tp1_up_gate_does_not_accept_sharded_tp2_or_invalid_layout(
     torch.testing.assert_close(output, before, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 33, 128, 512, 1024, 4096])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 33, 128, 512, 1024, 4096,
+                              4097, 8192])
 @pytest.mark.parametrize("injection_stride", [4, 336, 656])
 def test_dense_hc_math_and_materialized_fp16_residual(prefill_hc, m,
                                                      injection_stride):
@@ -359,7 +360,7 @@ def test_dense_hc_rejects_invalid_call_before_any_output_write(prefill_hc,
         torch.testing.assert_close(actual, original, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("m", [9, 17, 128, 4096])
+@pytest.mark.parametrize("m", [9, 17, 128, 4096, 4097, 8192])
 @pytest.mark.parametrize("injection_stride", [4, 336])
 @pytest.mark.parametrize("norm_local", ["256", "512"])
 def test_prefill_math_and_fp16_boundary(prefill_hc, monkeypatch, m,
